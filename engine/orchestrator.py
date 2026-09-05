@@ -219,6 +219,9 @@ class SilverBulletBot:
             max_volume=maximum,
             entry_price=setup.entry,
             max_notional_leverage=cfg.max_notional_leverage,
+            fixed_lots=cfg.fixed_lot_size,
+            max_risk_pct=cfg.max_risk_pct,
+            layers=cfg.entry_layers,
         )
         if not sizing.accepted:
             log.warning("[%s] Setup found but not sizeable: %s", label, sizing.reason)

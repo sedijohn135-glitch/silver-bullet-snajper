@@ -280,6 +280,8 @@ records *why* the first was rejected, so a quiet window still explains itself:
 | **One trade per window** | Enforced by writing a window label (`SB-BTCUSD-20260905-AFTERNOON`) onto every order and reading it back off `get_positions`/`get_pending_orders`. In-memory state resets on redeploy; the broker's order book does not. |
 | **Notional ceiling** | A position whose value exceeds `MAX_NOTIONAL_LEVERAGE` × balance is refused. This is a backstop against a *price-scale* failure: if auto-detection ever picked the wrong divisor, entry price arrives as 8,006,716,000 instead of 80,067 and every other number still looks reasonable. |
 | **Spread guard** | Entry is blocked above the active profile's `max_spread_points` (35 for gold, 700 for BTC), checked from `get_spot_prices` — and re-checked immediately before submission, because a minute can pass between analysis and execution. |
+| **Manual sizing** | `FIXED_LOT_SIZE` pins the size of each layer and bypasses percentage sizing, so a setup the 1% rule would refuse still gets taken. Risk then varies with the stop; the real percentage is computed and reported on every order, and `MAX_RISK_PCT` still caps the total. |
+| **Entry ladder** | `ENTRY_LAYERS=N` splits the entry into N limit orders spread across the FVG — rung 1 at the edge price reaches first, the last at the far edge. Stop and target are shared: the ladder changes where you get in, not where the idea is invalidated. Under percentage sizing the total is split across rungs, and the rung count is reduced rather than refusing the setup if each rung cannot clear the broker minimum. |
 | **Kill switch** | `KILL_SWITCH=true` blocks all new orders without a redeploy. |
 | **Stale orders** | Unfilled limits are cancelled once their window closes — an FVG entry that was not taken inside its window has lost its premise. |
 
@@ -346,7 +348,7 @@ reading before going live:
 ## Testing
 
 ```bash
-pytest            # 57 tests: strategy, risk, transport, instruments, integration
+pytest            # 65 tests: strategy, risk, transport, instruments, integration
 ```
 
 The integration tests run the entire bot — gateway, strategy, guards, sizing,

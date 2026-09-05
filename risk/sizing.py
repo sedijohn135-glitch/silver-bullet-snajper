@@ -19,16 +19,16 @@ log = get_logger("risk.sizing")
 
 @dataclass(frozen=True)
 class SizingResult:
-    lots: float
+    lots: float               # TOTAL size across every layer
     risk_amount: float        # the money we intended to risk
-    actual_risk: float        # what the rounded lot size really risks
+    actual_risk: float        # what the rounded total really risks
     risk_per_lot: float
     accepted: bool
     reason: str = ""
-
-    @property
-    def risk_pct_of(self) -> float:
-        return self.actual_risk
+    risk_pct: float = 0.0     # actual_risk as a percentage of balance
+    fixed: bool = False       # True when the operator pinned the lot size
+    layers: int = 1           # how many limit orders the entry is split into
+    lots_per_layer: float = 0.0
 
 
 def calculate_position_size(
@@ -42,6 +42,9 @@ def calculate_position_size(
     max_volume: float,
     entry_price: Optional[float] = None,
     max_notional_leverage: float = 0.0,
+    fixed_lots: float = 0.0,
+    max_risk_pct: float = 0.0,
+    layers: int = 1,
 ) -> SizingResult:
     """Lots to trade for ``risk_pct`` of ``balance`` behind ``stop_distance``.
 
@@ -58,22 +61,64 @@ def calculate_position_size(
 
     risk_amount = balance * (risk_pct / 100.0)
     risk_per_lot = stop_distance * contract_size
-    raw_lots = risk_amount / risk_per_lot
-    lots = round_to_step(raw_lots, volume_step, mode="down")
 
-    if lots < min_volume:
+    # --- operator-pinned lot size ---------------------------------------
+    # When FIXED_LOT_SIZE is set the position size stops being derived from
+    # risk. That is a deliberate trade-off: it guarantees the bot can act on a
+    # setup that percentage sizing would have refused, at the cost of a risk
+    # that now varies with the stop distance. The real figure is computed and
+    # reported on every order so it is never a surprise.
+    layers = max(1, int(layers))
+
+    if fixed_lots > 0:
+        per_layer = min(max(round_to_step(fixed_lots, volume_step, mode="down"), min_volume),
+                        max_volume)
+        used_layers = layers
+        # The total across the ladder still has to fit the broker's ceiling.
+        while used_layers > 1 and per_layer * used_layers > max_volume:
+            used_layers -= 1
+        lots = per_layer * used_layers
+        actual = lots * risk_per_lot
+        pct = actual / balance * 100.0
+        ladder = f"{used_layers}x{per_layer}" if used_layers > 1 else f"{per_layer}"
+        if max_risk_pct > 0 and pct > max_risk_pct:
+            return SizingResult(
+                0.0, risk_amount, actual, risk_per_lot, False,
+                f"Fixed {ladder} lots behind a {stop_distance:.2f} stop would risk "
+                f"{actual:.2f} ({pct:.2f}% of {balance:.2f}), above the "
+                f"{max_risk_pct:.2f}% ceiling - raise MAX_RISK_PCT, lower FIXED_LOT_SIZE, "
+                f"or use fewer ENTRY_LAYERS",
+                risk_pct=pct, fixed=True, layers=used_layers, lots_per_layer=per_layer,
+            )
+        return SizingResult(lots, risk_amount, actual, risk_per_lot, True,
+                            f"fixed size {ladder} ({pct:.2f}% of balance at risk)",
+                            risk_pct=pct, fixed=True,
+                            layers=used_layers, lots_per_layer=per_layer)
+
+    # --- risk-derived sizing, split across the ladder --------------------
+    raw_lots = min(risk_amount / risk_per_lot, max_volume)
+    used_layers = layers
+    per_layer = round_to_step(raw_lots / used_layers, volume_step, mode="down")
+    # A ladder is only worth having if each rung clears the broker minimum;
+    # otherwise take fewer, larger rungs rather than refusing the setup.
+    while per_layer < min_volume and used_layers > 1:
+        used_layers -= 1
+        per_layer = round_to_step(raw_lots / used_layers, volume_step, mode="down")
+
+    if per_layer < min_volume:
         return SizingResult(
             0.0, risk_amount, 0.0, risk_per_lot, False,
             f"Required size {raw_lots:.4f} lots is below the {min_volume} minimum - "
             f"taking the minimum would risk "
             f"{min_volume * risk_per_lot:.2f} ({min_volume * risk_per_lot / balance * 100:.2f}% "
-            f"of balance) instead of the permitted {risk_pct:.2f}%",
+            f"of balance) instead of the permitted {risk_pct:.2f}%. "
+            f"Set FIXED_LOT_SIZE to take the trade at a size you choose instead.",
         )
 
-    note = ""
-    if lots > max_volume:
-        lots = round_to_step(max_volume, volume_step, mode="down")
-        note = f"clamped to the {max_volume} lot maximum"
+    lots = per_layer * used_layers
+    note = f"{used_layers} layers of {per_layer}" if used_layers > 1 else ""
+    if used_layers < layers:
+        note += f" (reduced from {layers}: each rung must clear the {min_volume} minimum)"
 
     # Notional sanity check - a backstop against a *scale* failure.
     #
@@ -97,4 +142,6 @@ def calculate_position_size(
             )
 
     actual_risk = lots * risk_per_lot
-    return SizingResult(lots, risk_amount, actual_risk, risk_per_lot, True, note)
+    return SizingResult(lots, risk_amount, actual_risk, risk_per_lot, True, note,
+                        risk_pct=actual_risk / balance * 100.0,
+                        layers=used_layers, lots_per_layer=per_layer)

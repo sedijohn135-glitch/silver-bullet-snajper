@@ -293,3 +293,56 @@ def test_a_stop_on_the_wrong_side_of_entry_is_refused():
         gateway.describe_order_payload(OrderRequest(
             side="SELL", order_type="LIMIT", volume_lots=0.01, price=80_041.01,
             stop_loss=79_000.0, take_profit=78_000.0, label="x"))
+
+
+def test_entry_ladder_spreads_across_the_fair_value_gap():
+    """Rung 1 sits at the edge price reaches first; the last at the far edge."""
+    from datetime import datetime, timezone
+
+    from engine.executor import OrderExecutor
+    from mcp_client.ctrader import CTraderGateway
+    from risk.sizing import SizingResult
+    from strategy.models import Direction, FairValueGap, TradeSetup
+    from tests.fake_mcp import FakeConnection
+    from utils.telegram import NullNotifier
+
+    cfg = load_config()
+    gateway = CTraderGateway(cfg, FakeConnection())
+    gateway.symbols["BTCUSD"] = __import__("models").SymbolInfo(10026, "BTCUSD")
+    gateway.active_name = "BTCUSD"
+    executor = OrderExecutor(cfg, gateway, NullNotifier())
+
+    fvg = FairValueGap(Direction.SELL, top=80_100.0, bottom=80_000.0,
+                       first_index=0, middle_index=1, third_index=2,
+                       ts=datetime(2026, 9, 5, tzinfo=timezone.utc))
+    setup = TradeSetup(direction=Direction.SELL, entry=80_000.0, stop_loss=80_300.0,
+                       take_profit=79_400.0, risk_reward=2.0, sweep=None, mss=None,
+                       fvg=fvg, target=None, window="EVENING")
+    sizing = SizingResult(0.15, 0.0, 0.0, 0.0, True, layers=3, lots_per_layer=0.05)
+
+    requests = executor.build_requests(setup, sizing, "SB-BTCUSD-20260905-EVENING")
+    assert [r.price for r in requests] == [80_000.0, 80_050.0, 80_100.0]
+    assert all(r.volume_lots == 0.05 for r in requests)
+    assert [r.label[-2:] for r in requests] == ["L1", "L2", "L3"]
+    # The ladder changes where we get in, not where the idea is invalidated.
+    assert all(r.stop_loss == 80_300.0 and r.take_profit == 79_400.0 for r in requests)
+
+
+@pytest.mark.asyncio
+async def test_a_three_layer_ladder_places_three_orders(monkeypatch):
+    from tests.fake_mcp import FakeConnection
+    from tests.test_integration import make_bot
+
+    connection = FakeConnection(balance=10_000.0)
+    bot = make_bot(monkeypatch, connection, TRADING_MODE="live",
+                   ENTRY_LAYERS=3, FIXED_LOT_SIZE=0.05, MAX_RISK_PCT=50)
+    monkeypatch.setattr("engine.orchestrator.now_utc", lambda: fixtures.BTC_NOW)
+
+    await bot._tick()
+
+    assert len(connection.orders) == 3
+    assert all(o["symbolId"] == 10026 for o in connection.orders)
+    assert all(o["volume"] == 5 for o in connection.orders)   # 0.05 BTC x 100
+    prices = [o["limitPrice"] for o in connection.orders]
+    assert prices == sorted(prices), "a sell ladder climbs into the gap"
+    assert len({o["label"] for o in connection.orders}) == 3

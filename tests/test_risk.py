@@ -133,3 +133,58 @@ def test_first_blocker_reports_the_earliest_failure():
     blocker = first_blocker(verdicts)
     assert blocker is not None and blocker.code == "spread"
     assert first_blocker([check_kill_switch(False), check_balance(500.0, 0.0)]) is None
+
+
+# --- operator-controlled sizing ------------------------------------------
+
+def test_fixed_lot_size_takes_a_trade_percentage_sizing_would_refuse():
+    """Pinning the size is allowed; the real risk is then reported, not hidden."""
+    auto = size(balance=563.90, stop_distance=970.0, contract_size=1.0, max_volume=10.0)
+    assert not auto.accepted            # 1% of 563.90 cannot cover a 970-wide stop
+    assert "FIXED_LOT_SIZE" in auto.reason
+
+    fixed = size(balance=563.90, stop_distance=970.0, contract_size=1.0, max_volume=10.0,
+                 fixed_lots=0.01, max_risk_pct=10.0)
+    assert fixed.accepted and fixed.fixed
+    assert fixed.lots == pytest.approx(0.01)
+    assert fixed.actual_risk == pytest.approx(9.70)
+    assert fixed.risk_pct == pytest.approx(1.72, abs=0.01)
+
+
+def test_fixed_sizing_still_honours_a_risk_ceiling():
+    result = size(balance=563.90, stop_distance=8000.0, contract_size=1.0, max_volume=10.0,
+                  fixed_lots=0.1, max_risk_pct=10.0)
+    assert not result.accepted
+    assert "above the 10.00% ceiling" in result.reason
+
+
+def test_the_ceiling_can_be_switched_off_entirely():
+    result = size(balance=563.90, stop_distance=8000.0, contract_size=1.0, max_volume=10.0,
+                  fixed_lots=0.1, max_risk_pct=0.0)
+    assert result.accepted and result.risk_pct > 100
+
+
+def test_three_layers_of_a_fixed_size_multiply_the_total():
+    result = size(balance=563.90, stop_distance=200.0, contract_size=1.0, max_volume=10.0,
+                  fixed_lots=0.05, layers=3, max_risk_pct=50.0)
+    assert result.accepted
+    assert result.layers == 3
+    assert result.lots_per_layer == pytest.approx(0.05)
+    assert result.lots == pytest.approx(0.15)          # total across the ladder
+    assert result.actual_risk == pytest.approx(30.0)   # 0.15 x 200
+
+
+def test_risk_derived_sizing_splits_the_total_across_layers():
+    result = size(balance=10_000.0, stop_distance=11.50, layers=4)
+    assert result.layers == 4
+    assert result.lots == pytest.approx(result.lots_per_layer * 4)
+    assert result.actual_risk <= result.risk_amount    # still inside the 1% budget
+
+
+def test_layer_count_is_reduced_rather_than_refusing_the_setup():
+    """Ten rungs of a tiny position cannot each clear the broker minimum."""
+    result = size(balance=10_000.0, stop_distance=11.50, layers=10)
+    assert result.accepted
+    assert result.layers < 10
+    assert result.lots_per_layer >= 0.01
+    assert "reduced from 10" in result.reason

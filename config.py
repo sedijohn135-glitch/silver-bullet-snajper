@@ -181,6 +181,9 @@ class Config:
     include_open_pnl_in_drawdown: bool = True
     min_account_balance: float = 0.0
     max_notional_leverage: float = 500.0  # sanity ceiling on position value
+    fixed_lot_size: float = 0.0           # >0 pins the PER-LAYER lot size
+    entry_layers: int = 1                 # split the entry into N laddered limits
+    max_risk_pct: float = 10.0            # ceiling when fixed sizing is used (0=off)
 
     # --- strategy ---------------------------------------------------------
     entry_timeframe: str = "M1"
@@ -266,6 +269,9 @@ def load_config() -> Config:
         include_open_pnl_in_drawdown=env_bool("INCLUDE_OPEN_PNL_IN_DRAWDOWN", True),
         min_account_balance=env_float("MIN_ACCOUNT_BALANCE", 0.0, minimum=0.0),
         max_notional_leverage=env_float("MAX_NOTIONAL_LEVERAGE", 500.0, minimum=0.0),
+        fixed_lot_size=env_float("FIXED_LOT_SIZE", 0.0, minimum=0.0),
+        entry_layers=env_int("ENTRY_LAYERS", 1, minimum=1, maximum=20),
+        max_risk_pct=env_float("MAX_RISK_PCT", 10.0, minimum=0.0),
         entry_timeframe=env_str("ENTRY_TIMEFRAME", "M1").upper(),
         structure_timeframe=env_str("STRUCTURE_TIMEFRAME", "M5").upper(),
         htf_timeframe=env_str("HTF_TIMEFRAME", "H1").upper(),

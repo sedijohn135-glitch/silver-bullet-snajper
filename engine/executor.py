@@ -7,7 +7,7 @@ rehearsal rather than a different code path.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
@@ -16,6 +16,7 @@ from mcp_client.ctrader import CTraderGateway, OrderRequest
 from risk.sizing import SizingResult
 from strategy.models import TradeSetup
 from utils.logging import get_logger
+from utils.prices import round_price
 from utils.telegram import TelegramNotifier, esc
 
 log = get_logger("engine.executor")
@@ -28,9 +29,14 @@ class ExecutionRecord:
     setup: TradeSetup
     sizing: SizingResult
     label: str
-    payload: dict[str, Any]
-    response: Any = None
+    payloads: list[dict[str, Any]] = field(default_factory=list)
+    responses: list[Any] = field(default_factory=list)
     error: str = ""
+
+    @property
+    def payload(self) -> dict[str, Any]:
+        """The first rung - convenient when there is only one."""
+        return self.payloads[0] if self.payloads else {}
 
 
 class OrderExecutor:
@@ -40,74 +46,124 @@ class OrderExecutor:
         self._gateway = gateway
         self._notifier = notifier
 
+    def ladder_prices(self, setup: TradeSetup, layers: int) -> list[float]:
+        """Entry prices for each rung, spread across the fair value gap.
+
+        Rung 1 sits at the configured entry edge (the price reached first), and
+        the last rung at the far edge, so a deeper retracement fills more of the
+        position at a better price. With one layer, or without an FVG to span,
+        this is just the single configured entry.
+        """
+        if layers <= 1 or setup.fvg is None:
+            return [setup.entry]
+        start, end = setup.entry, setup.fvg.distal
+        step = (end - start) / (layers - 1)
+        point = self._gateway.point_size
+        return [round_price(start + step * i, point) for i in range(layers)]
+
+    def build_requests(self, setup: TradeSetup, sizing: SizingResult,
+                       label: str) -> list[OrderRequest]:
+        """One OrderRequest per rung. Stop and target are shared: the ladder
+        changes where we get in, not where the idea is invalidated."""
+        expiry = datetime.now(tz=timezone.utc) + timedelta(
+            minutes=self._cfg.order_expiry_minutes)
+        prices = self.ladder_prices(setup, sizing.layers)
+        volume = sizing.lots_per_layer or sizing.lots
+        multi = len(prices) > 1
+        return [
+            OrderRequest(
+                side=setup.direction.value,
+                order_type="LIMIT",      # Silver Bullet entries are always limits
+                volume_lots=volume,
+                price=price,
+                stop_loss=setup.stop_loss,
+                take_profit=setup.take_profit,
+                label=f"{label}-L{i + 1}" if multi else label,
+                comment=f"ICT SB {setup.window}",
+                expiry=expiry,
+            )
+            for i, price in enumerate(prices)
+        ]
+
     def build_request(self, setup: TradeSetup, sizing: SizingResult,
                       label: str) -> OrderRequest:
-        return OrderRequest(
-            side=setup.direction.value,
-            order_type="LIMIT",          # Silver Bullet entries are always limits
-            volume_lots=sizing.lots,
-            price=setup.entry,
-            stop_loss=setup.stop_loss,
-            take_profit=setup.take_profit,
-            label=label,
-            comment=f"ICT SB {setup.window}",
-            expiry=datetime.now(tz=timezone.utc)
-            + timedelta(minutes=self._cfg.order_expiry_minutes),
-        )
+        """Single-rung convenience used by the boot-time preflight."""
+        return self.build_requests(setup, sizing, label)[0]
 
     async def execute(self, setup: TradeSetup, sizing: SizingResult,
                       label: str) -> ExecutionRecord:
-        request = self.build_request(setup, sizing, label)
+        requests = self.build_requests(setup, sizing, label)
 
-        # Bind against the live schema first: in paper mode this proves the order
-        # *could* have been sent, and in live mode it fails before any network call
-        # if a required field cannot be filled.
+        # Bind every rung against the live schema first: in paper mode this
+        # proves the orders *could* have been sent, and in live mode it fails
+        # before any network call if a required field cannot be filled. Binding
+        # all of them up front also avoids a half-placed ladder.
+        payloads: list[dict[str, Any]] = []
         try:
-            payload = self._gateway.describe_order_payload(request)
+            for request in requests:
+                payloads.append(self._gateway.describe_order_payload(request))
         except Exception as exc:  # noqa: BLE001
             log.error("Could not build the create_order payload: %s", exc)
             await self._notifier.send(
                 f"⚠️ <b>Order build failed</b>\n{esc(str(exc)[:400])}",
                 dedup_key="order-build-failed",
             )
-            return ExecutionRecord(False, False, setup, sizing, label, {}, error=str(exc))
+            return ExecutionRecord(False, False, setup, sizing, label, error=str(exc))
 
         if not self._cfg.is_live:
-            log.info("[PAPER] Would submit create_order: %s", payload)
-            await self._notify(setup, sizing, label, simulated=True)
-            return ExecutionRecord(False, True, setup, sizing, label, payload)
+            for payload in payloads:
+                log.info("[PAPER] Would submit create_order: %s", payload)
+            await self._notify(setup, sizing, label, requests, simulated=True)
+            return ExecutionRecord(False, True, setup, sizing, label, payloads=payloads)
 
-        try:
-            response = await self._gateway.create_order(request)
-        except Exception as exc:  # noqa: BLE001
-            log.error("create_order failed: %s", exc)
-            await self._notifier.send(
-                f"❌ <b>Order rejected</b>\n{esc(setup.direction.value)} "
-                f"{sizing.lots} lots @ {setup.entry:.2f}\n<code>{esc(str(exc)[:400])}</code>",
-                dedup_key=f"order-error-{label}",
-            )
-            return ExecutionRecord(False, False, setup, sizing, label, payload, error=str(exc))
+        responses: list[Any] = []
+        for index, request in enumerate(requests, start=1):
+            try:
+                responses.append(await self._gateway.create_order(request))
+            except Exception as exc:  # noqa: BLE001
+                log.error("create_order failed on rung %s/%s: %s", index, len(requests), exc)
+                await self._notifier.send(
+                    f"❌ <b>Order rejected</b> (rung {index}/{len(requests)})\n"
+                    f"{esc(setup.direction.value)} {request.volume_lots} lots "
+                    f"@ {request.price:.2f}\n<code>{esc(str(exc)[:400])}</code>",
+                    dedup_key=f"order-error-{label}-{index}",
+                )
+                # Report what did get placed rather than pretending it all failed.
+                return ExecutionRecord(bool(responses), False, setup, sizing, label,
+                                       payloads=payloads, responses=responses,
+                                       error=str(exc))
 
-        log.info("Order accepted: %s", response)
-        await self._notify(setup, sizing, label, simulated=False)
-        return ExecutionRecord(True, False, setup, sizing, label, payload, response=response)
+        log.info("Ladder accepted (%s rung(s)): %s", len(responses), responses)
+        await self._notify(setup, sizing, label, requests, simulated=False)
+        return ExecutionRecord(True, False, setup, sizing, label,
+                               payloads=payloads, responses=responses)
 
-    async def _notify(self, setup: TradeSetup, sizing: SizingResult,
-                      label: str, *, simulated: bool) -> None:
+    async def _notify(self, setup: TradeSetup, sizing: SizingResult, label: str,
+                      requests: list[OrderRequest], *, simulated: bool) -> None:
         header = "📄 <b>PAPER ORDER</b>" if simulated else "🎯 <b>ORDER PLACED</b>"
         arrow = "🔻" if setup.direction.value == "SELL" else "🔺"
+        point = self._gateway.point_size
         narrative = "\n".join(f"• {esc(line)}" for line in setup.narrative)
+
+        if len(requests) > 1:
+            rungs = "\n".join(
+                f"   L{i}: {r.volume_lots} @ {r.price:.2f}"
+                for i, r in enumerate(requests, start=1)
+            )
+            entry_block = (f"<b>Entry ladder</b> {len(requests)} x {sizing.lots_per_layer} "
+                           f"lots\n{rungs}\n")
+        else:
+            entry_block = f"<b>Entry</b> {setup.entry:.2f}\n"
+
         await self._notifier.send(
             f"{header}\n"
-            f"{arrow} <b>{esc(setup.direction.value)} LIMIT {esc(self._gateway.active_name)}</b> "
-            f"{sizing.lots} lots\n"
-            f"<b>Entry</b> {setup.entry:.2f}\n"
-            f"<b>SL</b> {setup.stop_loss:.2f}  "
-            f"({setup.stop_distance / self._gateway.point_size:.0f}pt)\n"
+            f"{arrow} <b>{esc(setup.direction.value)} LIMIT "
+            f"{esc(self._gateway.active_name)}</b> {sizing.lots} lots total\n"
+            f"{entry_block}"
+            f"<b>SL</b> {setup.stop_loss:.2f}  ({setup.stop_distance / point:.0f}pt)\n"
             f"<b>TP</b> {setup.take_profit:.2f}  ({setup.risk_reward:.2f}R)\n"
-            f"<b>Risk</b> {sizing.actual_risk:.2f} "
-            f"({sizing.actual_risk / max(sizing.risk_amount, 1e-9) * self._cfg.risk_per_trade_pct:.2f}% "
-            f"of balance)\n"
+            f"<b>Risk</b> {sizing.actual_risk:.2f} ({sizing.risk_pct:.2f}% of balance)"
+            f"{' — fixed size' if sizing.fixed else ''}\n"
             f"<b>Window</b> {esc(setup.window)} | <code>{esc(label)}</code>\n\n"
             f"{narrative}"
         )
