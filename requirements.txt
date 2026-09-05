@@ -1,0 +1,17 @@
+# --- MCP client -------------------------------------------------------------
+# The bot supports both SDK generations (1.x exposes `streamablehttp_client`,
+# 2.x renamed it to `streamable_http_client`); the upper bound keeps a future
+# major release from silently changing the transport contract under a redeploy.
+mcp>=1.9.0,<3.0.0
+
+# --- HTTP -------------------------------------------------------------------
+# Used directly for the Telegram Bot API. Deliberately not python-telegram-bot:
+# the bot only ever sends one-way messages, so the full framework would add a
+# polling/Updater stack and ~10MB to the image for a single POST.
+httpx>=0.27.0
+
+# --- Timezones --------------------------------------------------------------
+# `zoneinfo` is stdlib from Python 3.9, but slim container images ship without
+# the IANA database; this package provides it so ZoneInfo("Europe/Tirane")
+# resolves (and handles CET/CEST transitions) inside Docker.
+tzdata>=2024.1
