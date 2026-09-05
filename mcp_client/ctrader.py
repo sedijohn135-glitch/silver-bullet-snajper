@@ -17,7 +17,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Optional, Sequence
 
 from config import Config
-from mcp_client.errors import ToolCallError, ToolUnavailable
+from mcp_client.errors import SchemaBindError, ToolCallError, ToolUnavailable
 from mcp_client.parsing import (
     as_float, as_int, collect_numbers, extract_payload, find_list,
     normalize_side, parse_timestamp, pick,
@@ -577,8 +577,37 @@ class CTraderGateway:
             return wire_volume / (contract * 100.0)
         return wire_volume
 
+    def _has_relative_variant(self, canonical: str) -> bool:
+        """Does the schema expose a separate ``relative*`` field for this value?
+
+        cTrader offers both ``stopLoss`` (an absolute price) and
+        ``relativeStopLoss`` (a distance). The existence of the relative variant
+        is decisive structural proof that the plain field is the absolute one -
+        far stronger evidence than description text, which routinely mentions
+        pips precisely to point the reader at the other field.
+        """
+        tool = self._tool(TOOL_CREATE_ORDER)
+        if tool is None:
+            return False
+        core = {"stop_loss": "stoploss", "take_profit": "takeprofit"}.get(canonical)
+        if not core:
+            return False
+        return any(
+            "relative" in normalize(prop) and core in normalize(prop)
+            for prop in tool.properties
+        )
+
     def _price_field_mode(self, canonical: str) -> str:
-        """Does the SL/TP field want an absolute price, pips, or points?"""
+        """Does the SL/TP field want an absolute price, pips, or points?
+
+        Only the *field name* is consulted. Reading the description was a real
+        bug: cTrader's `stopLoss` description mentions pips (to direct you to
+        `relativeStopLoss`), which made the bot send a 100.0 "price" on an
+        80,000 instrument.
+        """
+        if self._has_relative_variant(canonical):
+            return "price"
+
         tool = self._tool(TOOL_CREATE_ORDER)
         if tool is None:
             return "price"
@@ -586,10 +615,10 @@ class CTraderGateway:
         for prop, mapped in map_properties(tool).items():
             if mapped != canonical:
                 continue
-            text = f"{prop} {tool.properties.get(prop, {}).get('description', '')}".lower()
-            if "pip" in text:
+            name = normalize(prop)
+            if "pip" in name:
                 return "pips"
-            if "point" in text:
+            if "point" in name:
                 return "points"
             return "price"
         return "price"
@@ -603,7 +632,8 @@ class CTraderGateway:
         if mode == "price":
             return absolute
         distance_points = abs(absolute - reference) / self.point_size
-        return distance_points / 10.0 if mode == "pips" else distance_points
+        distance = distance_points / 10.0 if mode == "pips" else distance_points
+        return round(distance, 2)   # kill binary-float dust like 1.999999999998
 
     # -- order actions -----------------------------------------------------
 
@@ -636,12 +666,52 @@ class CTraderGateway:
             values["time_in_force"] = Candidates.of("GOOD_TILL_DATE", "GTD")
 
         arguments = bind_arguments(tool, values, extras=self._cfg_extra_order_fields())
+        self._validate_price_levels(arguments, request)
         # Never leave a dangling time-in-force if the expiry itself was dropped.
         tif_prop = self._property_for("time_in_force")
         expiry_prop = self._property_for("expiry")
         if tif_prop and expiry_prop and tif_prop in arguments and expiry_prop not in arguments:
             arguments.pop(tif_prop)
         return arguments
+
+    def _validate_price_levels(self, arguments: dict[str, Any],
+                               request: OrderRequest) -> None:
+        """Refuse a payload whose stop/target are not credible prices.
+
+        Absolute levels must sit on the correct side of the entry and within a
+        sane distance of it. This is the last line of defence against a
+        units/price mix-up: a stop of 100.0 on an 80,000 instrument passes every
+        type check in the schema and would still be catastrophic.
+        """
+        entry = request.price
+        if entry is None or entry <= 0:
+            return
+
+        for canonical, expected_above in (("stop_loss", request.side == "SELL"),
+                                          ("take_profit", request.side == "BUY")):
+            if self._price_field_mode(canonical) != "price":
+                continue
+            prop = self._property_for(canonical)
+            if prop is None or prop not in arguments:
+                continue
+            level = float(arguments[prop])
+
+            if abs(level - entry) > entry * 0.5:
+                raise SchemaBindError(
+                    f"{prop}={level} is implausible against an entry of {entry} "
+                    f"for {self.active_name}. This usually means the field wants a "
+                    f"distance, not a price - check the live schema."
+                )
+            if expected_above and level <= entry:
+                raise SchemaBindError(
+                    f"{prop}={level} must be above the {entry} entry for a "
+                    f"{request.side} {canonical.replace('_', ' ')}"
+                )
+            if not expected_above and level >= entry:
+                raise SchemaBindError(
+                    f"{prop}={level} must be below the {entry} entry for a "
+                    f"{request.side} {canonical.replace('_', ' ')}"
+                )
 
     def _property_for(self, canonical: str) -> Optional[str]:
         """Upstream property name that carries ``canonical`` on create_order."""

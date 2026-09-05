@@ -135,6 +135,7 @@ v1.0.18), not assumed, and the client is built around them:
 | `create_order.volume` | Declared **`integer`** — so it is not lots. cTrader carries volume as 1/100 of a unit, so 0.10 BTC is `10` and 0.08 lots of gold is `800` |
 | `create_order` expiry | `expirationTimestamp` is an **integer** (epoch ms), paired with `timeInForce=GOOD_TILL_DATE` |
 | Order/position ids | Integers, not strings |
+| `stopLoss` / `takeProfit` | **Absolute prices**. The distance variants are separate fields (`relativeStopLoss`, `relativeTakeProfit`) |
 
 Two of these shaped the design directly:
 
@@ -153,6 +154,13 @@ Two of these shaped the design directly:
   says so in the log.
 * A value the schema cannot represent is **dropped**, not sent: an ISO timestamp
   bound into an `integer` field would get the whole order rejected.
+* Whether a stop is a *price* or a *distance* is decided by the field name and by
+  whether a separate `relative*` variant exists — never by the description text.
+  cTrader's `stopLoss` description mentions pips in order to point you at
+  `relativeStopLoss`, and reading it literally made the bot send `100.0` as the
+  stop for an 80,000 instrument. A finished payload is then validated: absolute
+  levels must sit on the correct side of entry and within a credible distance of
+  it, or the order is refused rather than sent.
 
 ### Resilience
 
@@ -338,7 +346,7 @@ reading before going live:
 ## Testing
 
 ```bash
-pytest            # 54 tests: strategy, risk, transport, instruments, integration
+pytest            # 57 tests: strategy, risk, transport, instruments, integration
 ```
 
 The integration tests run the entire bot — gateway, strategy, guards, sizing,

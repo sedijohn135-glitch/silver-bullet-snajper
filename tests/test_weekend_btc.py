@@ -237,3 +237,59 @@ async def test_preflight_prints_a_real_payload_for_every_instrument(monkeypatch,
     assert any("BTCUSD" in line for line in lines)
     # Minimum size must survive the integer volume field, not round to zero.
     assert all("wire volume 0" not in line for line in lines), lines
+
+
+def test_stop_and_target_are_sent_as_absolute_prices_not_distances():
+    """`stopLoss` is a price; `relativeStopLoss` is the distance field.
+
+    The live schema's `stopLoss` description mentions pips - to point you at the
+    relative field - which fooled a description-based heuristic into sending
+    100.0 as the stop for an 80,000 instrument.
+    """
+    from datetime import datetime, timezone
+
+    from mcp_client.ctrader import CTraderGateway, OrderRequest
+    from tests.fake_mcp import FakeConnection
+
+    gateway = CTraderGateway(load_config(), FakeConnection())
+    gateway.symbols["BTCUSD"] = __import__("models").SymbolInfo(10026, "BTCUSD")
+    gateway.active_name = "BTCUSD"
+
+    payload = gateway.describe_order_payload(OrderRequest(
+        side="SELL", order_type="LIMIT", volume_lots=0.01, price=80_041.01,
+        stop_loss=80_051.01, take_profit=80_021.01, label="SB-PREFLIGHT",
+        expiry=datetime(2026, 9, 5, 21, 0, tzinfo=timezone.utc)))
+
+    assert payload["stopLoss"] == pytest.approx(80_051.01)     # a price, not 100.0
+    assert payload["takeProfit"] == pytest.approx(80_021.01)
+    assert payload["stopLoss"] > payload["limitPrice"] > payload["takeProfit"]
+
+
+def test_an_implausible_stop_is_refused_before_it_can_be_sent():
+    from mcp_client.ctrader import CTraderGateway, OrderRequest
+    from mcp_client.errors import SchemaBindError
+    from tests.fake_mcp import FakeConnection
+
+    gateway = CTraderGateway(load_config(), FakeConnection())
+    gateway.symbols["BTCUSD"] = __import__("models").SymbolInfo(10026, "BTCUSD")
+    gateway.active_name = "BTCUSD"
+
+    with pytest.raises(SchemaBindError, match="implausible"):
+        gateway.describe_order_payload(OrderRequest(
+            side="SELL", order_type="LIMIT", volume_lots=0.01, price=80_041.01,
+            stop_loss=100.0, take_profit=200.0, label="x"))
+
+
+def test_a_stop_on_the_wrong_side_of_entry_is_refused():
+    from mcp_client.ctrader import CTraderGateway, OrderRequest
+    from mcp_client.errors import SchemaBindError
+    from tests.fake_mcp import FakeConnection
+
+    gateway = CTraderGateway(load_config(), FakeConnection())
+    gateway.symbols["BTCUSD"] = __import__("models").SymbolInfo(10026, "BTCUSD")
+    gateway.active_name = "BTCUSD"
+
+    with pytest.raises(SchemaBindError, match="must be above"):
+        gateway.describe_order_payload(OrderRequest(
+            side="SELL", order_type="LIMIT", volume_lots=0.01, price=80_041.01,
+            stop_loss=79_000.0, take_profit=78_000.0, label="x"))

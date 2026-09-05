@@ -64,10 +64,16 @@ TOOLS = [
             "volume": {"type": "integer"},
             "limitPrice": {"type": "number"},
             "stopPrice": {"type": "number"},
-            "stopLoss": {"type": "number"},
-            "takeProfit": {"type": "number"},
-            "relativeStopLoss": {"type": "integer"},
-            "relativeTakeProfit": {"type": "integer"},
+            # The descriptions matter: they mention pips in order to point the
+            # reader at the relative fields, which is exactly what fooled an
+            # earlier description-based heuristic into sending a distance as a price.
+            "stopLoss": {"type": "number",
+                         "description": "Stop loss price. For pips use relativeStopLoss."},
+            "takeProfit": {"type": "number",
+                           "description": "Take profit price. For pips use relativeTakeProfit."},
+            "relativeStopLoss": {"type": "integer", "description": "Relative stop loss in pips"},
+            "relativeTakeProfit": {"type": "integer",
+                                   "description": "Relative take profit in pips"},
             "comment": {"type": "string"},
             "label": {"type": "string"},
             "timeInForce": {"type": "string",
