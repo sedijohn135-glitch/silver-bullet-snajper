@@ -22,16 +22,27 @@ from utils.telegram import TelegramNotifier, esc
 log = get_logger("engine.monitor")
 
 
+@dataclass(frozen=True)
+class Closure:
+    position_id: str
+    pnl: float
+    outcome: str
+    pnl_known: bool          # False when no closing deal could be matched
+
+
 @dataclass
 class MonitorReport:
     positions: list[Position]
     pending: list[PendingOrder]
     deals: list[Deal]
     filled: list[Position]
-    closed: list[tuple[str, float, str]]   # (position_id, pnl, outcome)
+    closed: list[Closure]
 
 
 class TradeMonitor:
+    #: How many polls to wait for a closing deal before giving up on the P&L.
+    DEAL_LOOKUP_ATTEMPTS = 6
+
     def __init__(self, cfg: Config, gateway: CTraderGateway,
                  notifier: TelegramNotifier, state: BotState) -> None:
         self._cfg = cfg
@@ -39,6 +50,8 @@ class TradeMonitor:
         self._notifier = notifier
         self._state = state
         self._tracked: dict[str, Position] = {}
+        #: position id -> polls spent waiting for its closing deal to appear.
+        self._awaiting_deals: dict[str, int] = {}
 
     async def poll(self, day_start: datetime) -> MonitorReport:
         """Refresh account state and emit notifications for any transitions."""
@@ -51,41 +64,85 @@ class TradeMonitor:
 
         self._state.known_position_ids = {p.position_id for p in positions}
         self._state.known_order_ids = {o.order_id for o in pending}
-        self._tracked = {p.position_id: p for p in positions}
+        self._tracked = {
+            **{pid: pos for pid, pos in self._tracked.items() if pid in self._awaiting_deals},
+            **{p.position_id: p for p in positions},
+        }
 
         for position in filled:
             await self._notify_fill(position)
-        for position_id, pnl, outcome in closed:
-            await self._notify_close(position_id, pnl, outcome)
+        for closure in closed:
+            await self._notify_close(closure)
 
         return MonitorReport(positions, pending, deals, filled, closed)
 
     # -- transitions -------------------------------------------------------
 
     def _detect_fills(self, positions: Sequence[Position]) -> list[Position]:
-        """Positions we have not seen before, that carry one of our labels."""
+        """Positions that appeared since the last poll, on the symbol we trade.
+
+        Deliberately not gated on our order label: brokers do not reliably echo
+        a pending order's label onto the position it becomes, and a fill that
+        goes unannounced is the single worst thing this monitor can do. Anything
+        new on the active symbol is reported; the message says whether it carries
+        our label.
+        """
         known = self._state.known_position_ids
-        return [
-            p for p in positions
-            if p.position_id and p.position_id not in known and self._is_ours(p.label)
-        ]
+        symbol_id = self._gateway.symbol.symbol_id if self._gateway.symbol else None
+        fresh = []
+        for position in positions:
+            if not position.position_id or position.position_id in known:
+                continue
+            same_symbol = (
+                symbol_id is not None and position.symbol_id == symbol_id
+            ) or (
+                position.symbol_name
+                and position.symbol_name.upper() == self._gateway.active_name.upper()
+            )
+            if same_symbol or self._is_ours(position.label):
+                fresh.append(position)
+        return fresh
 
     async def _detect_closures(
         self, positions: Sequence[Position], deals: Sequence[Deal]
-    ) -> list[tuple[str, float, str]]:
-        """Positions that vanished since the last poll, with their realised P&L."""
+    ) -> list[Closure]:
+        """Positions that vanished since the last poll, with their realised P&L.
+
+        The closing deal reaches ``get_deals`` a little after the position
+        disappears from ``get_positions``. Reporting immediately therefore finds
+        no deal, sums to zero, and announces "+0.00" as though that were the
+        result - and then never revisits it. So a closure with no matching deal
+        is *deferred* for a few polls, and only reported as unknown if the deal
+        never turns up.
+        """
         current = {p.position_id for p in positions}
         vanished = [pid for pid in self._state.known_position_ids
                     if pid and pid not in current and pid not in self._state.reported_closures]
-
-        closures: list[tuple[str, float, str]] = []
         for position_id in vanished:
+            self._awaiting_deals.setdefault(position_id, 0)
+
+        closures: list[Closure] = []
+        for position_id, attempts in list(self._awaiting_deals.items()):
             related = [d for d in deals if d.position_id == position_id]
+            attempts += 1                       # this poll is one lookup
+            self._awaiting_deals[position_id] = attempts
+            if not related and attempts < self.DEAL_LOOKUP_ATTEMPTS:
+                log.debug("Closure of %s has no deal yet (lookup %s/%s); deferring",
+                          position_id, attempts, self.DEAL_LOOKUP_ATTEMPTS)
+                continue
+
             pnl = sum(d.net_profit for d in related)
             tracked = self._tracked.get(position_id)
-            outcome = self._classify(pnl, tracked, related)
+            if related:
+                outcome = self._classify(pnl, tracked, related)
+            else:
+                outcome = "CLOSED"
+                log.warning("Position %s closed but no deal was found after %s lookups; "
+                            "reporting without a P&L figure.",
+                            position_id, attempts)
+            self._awaiting_deals.pop(position_id, None)
             self._state.reported_closures.add(position_id)
-            closures.append((position_id, pnl, outcome))
+            closures.append(Closure(position_id, pnl, outcome, pnl_known=bool(related)))
         return closures
 
     def _classify(self, pnl: float, position: Optional[Position],
@@ -127,13 +184,24 @@ class TradeMonitor:
         await self._notifier.send("\n".join(lines),
                                   dedup_key=f"fill-{position.position_id}")
 
-    async def _notify_close(self, position_id: str, pnl: float, outcome: str) -> None:
-        icon = "🟢" if pnl > 0 else ("🔴" if pnl < 0 else "⚪")
+    async def _notify_close(self, closure: Closure) -> None:
+        if not closure.pnl_known:
+            # Never print "+0.00" for a figure we could not read - that reads as
+            # a breakeven result rather than as missing information.
+            await self._notifier.send(
+                f"⚪ <b>{esc(closure.outcome)}</b>\n"
+                f"Position <code>{esc(closure.position_id)}</code>\n"
+                f"<b>Realised P&amp;L</b> not reported by the broker yet - "
+                f"check the account history.",
+                dedup_key=f"close-{closure.position_id}",
+            )
+            return
+        icon = "🟢" if closure.pnl > 0 else ("🔴" if closure.pnl < 0 else "⚪")
         await self._notifier.send(
-            f"{icon} <b>{esc(outcome)}</b>\n"
-            f"Position <code>{esc(position_id)}</code>\n"
-            f"<b>Realised P&amp;L</b> {pnl:+.2f}",
-            dedup_key=f"close-{position_id}",
+            f"{icon} <b>{esc(closure.outcome)}</b>\n"
+            f"Position <code>{esc(closure.position_id)}</code>\n"
+            f"<b>Realised P&amp;L</b> {closure.pnl:+.2f}",
+            dedup_key=f"close-{closure.position_id}",
         )
 
     # -- housekeeping ------------------------------------------------------

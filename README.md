@@ -291,6 +291,16 @@ records *why* the first was rejected, so a quiet window still explains itself:
 
 Order entries (with the full setup narrative), fills, TP/SL hits with realised
 P&L, cancellations, sizing refusals, drawdown halts, and connection/auth errors.
+
+Two details that matter in practice. A fill is announced for any new position on
+the traded symbol, **not** only ones carrying our order label: brokers do not
+reliably echo a pending order's label onto the position it becomes, and a silent
+fill is the worst thing this monitor can do. And a closing deal reaches
+`get_deals` a moment *after* the position disappears from `get_positions`, so a
+closure with no matching deal is deferred for several polls rather than announced
+as `+0.00` — a figure that reads as breakeven when it actually means "not read
+yet". If the deal never arrives, the message says the P&L is unavailable instead
+of inventing a number.
 Alerts are de-duplicated over a short window so an outage cannot flood the chat.
 
 The notifier talks to the Bot API directly with `httpx` rather than pulling in
@@ -348,7 +358,7 @@ reading before going live:
 ## Testing
 
 ```bash
-pytest            # 65 tests: strategy, risk, transport, instruments, integration
+pytest            # 69 tests: strategy, risk, transport, instruments, integration
 ```
 
 The integration tests run the entire bot — gateway, strategy, guards, sizing,
