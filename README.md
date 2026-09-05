@@ -37,8 +37,16 @@ python main.py                # starts in paper mode
 2. Set the variables from `.env.example` under **Variables**. At minimum:
    `CTRADER_MCP_TOKEN`, `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID`.
 3. Leave `TRADING_MODE=paper` for the first session and watch the logs.
-4. Deploy as a **worker**. If you deploy it as a web service instead, Railway
-   sets `PORT` and the bot automatically serves `/health` and `/status`.
+4. Deploy as a **worker** — the bot is a long-running scheduler, not an HTTP
+   service. That is the single process type declared in the `Procfile`. If you
+   deploy it as a web service instead, Railway sets `PORT` and the bot
+   automatically serves `/health` and `/status` on it.
+
+> **Note on the `Procfile`:** the format has no comment syntax. Every non-empty
+> line is parsed as `<process type>: <command>`, split on the first colon, so a
+> `#`-prefixed line containing a colon is still read as a process definition and
+> Railway will create a service that tries to execute the prose. Keep the file to
+> its one real line.
 
 ---
 
