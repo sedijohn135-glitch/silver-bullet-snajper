@@ -15,6 +15,7 @@ from strategy.fvg import find_fvgs, mitigation_ratio
 from strategy.liquidity import build_pools, detect_sweep, detect_sweeps, find_swings
 from strategy.models import Direction
 from strategy.silver_bullet import MarketSnapshot, SilverBulletStrategy
+from symbols import XAUUSD
 from tests import fixtures
 
 
@@ -39,7 +40,7 @@ def cfg():
 
 @pytest.fixture()
 def strategy(cfg):
-    return SilverBulletStrategy(cfg, point_size=0.01)
+    return SilverBulletStrategy(cfg, XAUUSD)
 
 
 def test_pools_include_session_and_previous_day_levels(cfg, strategy):

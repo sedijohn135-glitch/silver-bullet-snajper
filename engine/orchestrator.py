@@ -32,6 +32,7 @@ from risk.guards import (
 from risk.sizing import calculate_position_size
 from strategy.silver_bullet import MarketSnapshot, SilverBulletStrategy
 from utils.logging import get_logger
+from symbols import symbol_for_day
 from utils.sessions import (
     active_window, local_day_start_utc, next_window_start, now_utc, to_local, window_key,
 )
@@ -52,6 +53,7 @@ class SilverBulletBot:
         self.state = BotState()
         self.store = StateStore(cfg.state_dir)
         self.strategy = SilverBulletStrategy(cfg)
+        self._active_symbol: Optional[str] = None
         self.monitor = TradeMonitor(cfg, self.gateway, notifier, self.state)
         self.executor = OrderExecutor(cfg, self.gateway, notifier)
 
@@ -107,9 +109,14 @@ class SilverBulletBot:
         # re-derived against the session we are actually talking to now.
         if self._bootstrapped_for != self.connection.stats.connects:
             await self.gateway.bootstrap()
-            self.strategy.point_size = self.gateway.point_size
             self._bootstrapped_for = self.connection.stats.connects
+            self._active_symbol = None
             await self._announce_startup()
+
+        # XAUUSD is shut from Friday evening to Sunday evening while BTCUSD runs
+        # continuously, so the instrument is chosen per local day.
+        if not self._select_instrument(now):
+            return
 
         window = active_window(now)
         day_start = local_day_start_utc(now)
@@ -155,10 +162,11 @@ class SilverBulletBot:
                 report.positions, report.pending,
                 window_label=label,
                 symbol_id=self.gateway.symbol.symbol_id if self.gateway.symbol else None,
-                symbol_name=cfg.symbol,
+                symbol_name=self.gateway.active_name,
                 block_any_symbol_exposure=cfg.block_if_any_symbol_exposure,
             ),
-            check_spread(quote, self.gateway.point_size, cfg.max_spread_points),
+            check_spread(quote, self.gateway.point_size,
+                         self.gateway.profile.max_spread_points),
         ]
         blocker = first_blocker(verdicts)
         if blocker is not None:
@@ -195,10 +203,12 @@ class SilverBulletBot:
             balance=balance.balance,
             risk_pct=cfg.risk_per_trade_pct,
             stop_distance=setup.stop_distance,
-            contract_size=cfg.contract_size,
+            contract_size=self.gateway.profile.contract_size,
             volume_step=step,
             min_volume=minimum,
             max_volume=maximum,
+            entry_price=setup.entry,
+            max_notional_leverage=cfg.max_notional_leverage,
         )
         if not sizing.accepted:
             log.warning("[%s] Setup found but not sizeable: %s", label, sizing.reason)
@@ -210,7 +220,8 @@ class SilverBulletBot:
 
         # --- final pre-flight -------------------------------------------
         fresh_quote = await self.gateway.get_quote()
-        spread_now = check_spread(fresh_quote, self.gateway.point_size, cfg.max_spread_points)
+        spread_now = check_spread(fresh_quote, self.gateway.point_size,
+                                  self.gateway.profile.max_spread_points)
         if not spread_now.allowed:
             log.warning("[%s] Spread widened before submission: %s", label, spread_now.reason)
             return
@@ -219,7 +230,7 @@ class SilverBulletBot:
         exposure_now = check_window_exposure(
             positions, pending, window_label=label,
             symbol_id=self.gateway.symbol.symbol_id if self.gateway.symbol else None,
-            symbol_name=cfg.symbol,
+            symbol_name=self.gateway.active_name,
             block_any_symbol_exposure=cfg.block_if_any_symbol_exposure,
         )
         if not exposure_now.allowed:
@@ -236,6 +247,40 @@ class SilverBulletBot:
 
     # -- helpers -----------------------------------------------------------
 
+    def _select_instrument(self, now: datetime) -> bool:
+        """Point the gateway and strategy at today's instrument.
+
+        Returns False when there is nothing to trade today (weekend trading
+        disabled), which parks the bot for the day without touching the market.
+        """
+        local_day = to_local(now).date()
+        wanted = symbol_for_day(
+            local_day,
+            weekday_symbol=self._cfg.symbol,
+            weekend_symbol=self._cfg.weekend_symbol,
+            weekend_enabled=self._cfg.weekend_trading,
+        )
+        if wanted is None:
+            if self._active_symbol is not None:
+                log.info("Weekend trading disabled; idling until Monday.")
+                self._active_symbol = None
+            return False
+
+        if wanted == self._active_symbol:
+            return True
+
+        try:
+            self.gateway.set_active(wanted)
+        except Exception as exc:  # noqa: BLE001 - a missing symbol must not crash the loop
+            log.error("Cannot activate %s: %s", wanted, exc)
+            self.state.last_error = f"activate {wanted}: {exc}"
+            return False
+
+        self.strategy.set_instrument(self.gateway.profile, self.gateway.point_size)
+        self._active_symbol = wanted
+        log.info("Trading %s today (%s)", wanted, local_day.strftime("%A"))
+        return True
+
     def _volume_limits(self) -> tuple[float, float, float]:
         """Broker volume constraints, falling back to configuration.
 
@@ -243,15 +288,22 @@ class SilverBulletBot:
         floor - but when the broker does publish them they win, since an order
         off the volume grid is rejected outright.
         """
-        cfg = self._cfg
+        profile = self.gateway.profile
         symbol = self.gateway.symbol
-        step = (symbol.volume_step if symbol and symbol.volume_step else cfg.volume_step)
-        minimum = (symbol.min_volume if symbol and symbol.min_volume else cfg.min_volume)
-        maximum = (symbol.max_volume if symbol and symbol.max_volume else cfg.max_volume)
+        step = (symbol.volume_step if symbol and symbol.volume_step else profile.volume_step)
+        minimum = (symbol.min_volume if symbol and symbol.min_volume else profile.min_volume)
+        maximum = (symbol.max_volume if symbol and symbol.max_volume else profile.max_volume)
         return step, minimum, maximum
 
     def _label(self, window, now: datetime) -> str:
-        return f"{self._cfg.order_label_prefix}-{window_key(window, now)}"
+        """Order label: prefix, instrument, local day, window.
+
+        The instrument is part of the key so the one-trade-per-window rule is
+        scoped per symbol, and so a gold order can never be mistaken for a
+        Bitcoin one when the labels are read back off the broker.
+        """
+        return (f"{self._cfg.order_label_prefix}-{self.gateway.active_name}"
+                f"-{window_key(window, now)}")
 
     async def _report_block(self, label: str, blocker: GuardVerdict, pnl) -> None:
         """Log once per (window, guard) so a blocked window does not spam."""
@@ -270,15 +322,24 @@ class SilverBulletBot:
     async def _announce_startup(self) -> None:
         cfg = self._cfg
         env_verdict = check_environment(cfg.trading_mode, self._token, cfg.allow_live_environment)
-        mode_line = (
-            "LIVE ORDERS ENABLED" if env_verdict.allowed and cfg.is_live
-            else f"SIMULATED ({esc(env_verdict.reason)})"
+        live = env_verdict.allowed and cfg.is_live
+        mode_line = "LIVE ORDERS ENABLED" if live else f"SIMULATED ({esc(env_verdict.reason)})"
+        icon = "🔴" if live else "🟡"
+
+        instruments = f"{esc(cfg.symbol)} Mon-Fri"
+        if cfg.weekend_trading and cfg.weekend_symbol:
+            instruments += f", {esc(cfg.weekend_symbol)} Sat/Sun"
+        else:
+            instruments += " (weekend trading off)"
+        specs = "\n".join(
+            f"  <code>{esc(p.describe())}</code>" for p in (cfg.profiles or {}).values()
         )
-        icon = "🔴" if (env_verdict.allowed and cfg.is_live) else "🟡"
+
         tools = self.connection.catalog.names
         await self._notifier.send(
             f"{icon} <b>ICT Silver Bullet bot online</b>\n"
-            f"<b>Symbol</b> {esc(cfg.symbol)} (id {self.gateway.symbol.symbol_id if self.gateway.symbol else '?'})\n"
+            f"<b>Instruments</b> {instruments}\n"
+            f"{specs}\n"
             f"<b>Account</b> {esc(self._token.describe())}\n"
             f"<b>Mode</b> {mode_line}\n"
             f"<b>Risk</b> {cfg.risk_per_trade_pct:.2f}%/trade, "
@@ -297,7 +358,9 @@ class SilverBulletBot:
             "healthy": self.connection.state in (ConnectionState.READY, ConnectionState.CONNECTING),
             "mode": self._cfg.trading_mode,
             "environment": self._token.environment or "unknown",
-            "symbol": self._cfg.symbol,
+            "symbol": self.gateway.active_name,
+            "weekday_symbol": self._cfg.symbol,
+            "weekend_symbol": self._cfg.weekend_symbol if self._cfg.weekend_trading else None,
             "active_window": window.name if window else None,
             "next_window": next_window_start().isoformat(),
             "connection": self.connection.snapshot(),

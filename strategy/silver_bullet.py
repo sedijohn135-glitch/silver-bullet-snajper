@@ -33,6 +33,7 @@ from strategy.models import (
     SwingPoint, TradeSetup,
 )
 from strategy.structure import detect_mss, leg_extreme
+from symbols import SymbolProfile, profile_for
 from utils.logging import get_logger
 from utils.prices import round_price
 
@@ -53,9 +54,22 @@ class MarketSnapshot:
 
 
 class SilverBulletStrategy:
-    def __init__(self, cfg: Config, point_size: Optional[float] = None) -> None:
+    def __init__(self, cfg: Config, profile: Optional[SymbolProfile] = None,
+                 point_size: Optional[float] = None) -> None:
         self._cfg = cfg
-        self.point_size = point_size or cfg.point_size
+        self.profile = profile or profile_for(cfg.symbol)
+        self.point_size = point_size or self.profile.point_size
+
+    def set_instrument(self, profile: SymbolProfile,
+                       point_size: Optional[float] = None) -> None:
+        """Retarget the strategy at another instrument.
+
+        Called when the weekday/weekend symbol changes. Every threshold below is
+        expressed in points, and a point on gold is ~85x smaller than a point on
+        Bitcoin, so the profile has to travel with the switch.
+        """
+        self.profile = profile
+        self.point_size = point_size or profile.point_size
 
     # -- helpers -----------------------------------------------------------
 
@@ -74,6 +88,7 @@ class SilverBulletStrategy:
             return result.reject(f"Not enough candles to analyse ({len(candles)})")
 
         cfg = self._cfg
+        profile = self.profile
         swings = find_swings(candles, cfg.swing_strength)
 
         # --- Step 1: liquidity ------------------------------------------
@@ -89,10 +104,10 @@ class SilverBulletStrategy:
             structure,
             swings,
             snapshot.now,
-            equal_tolerance=self.points(cfg.equal_level_tolerance_points),
+            equal_tolerance=self.points(profile.equal_level_tolerance_points),
             extra_pools=extra_pools,
             tapped_until=lookback_start,
-            tap_tolerance=self.points(cfg.min_sweep_penetration_points),
+            tap_tolerance=self.points(profile.min_sweep_penetration_points),
         )
         result.pools_considered = len(pools)
         if not pools:
@@ -102,7 +117,7 @@ class SilverBulletStrategy:
             candles,
             pools,
             since=lookback_start,
-            min_penetration=self.points(cfg.min_sweep_penetration_points),
+            min_penetration=self.points(profile.min_sweep_penetration_points),
         )
         if not sweeps:
             return result.reject(
@@ -131,6 +146,7 @@ class SilverBulletStrategy:
     ) -> Optional[TradeSetup]:
         """Try to build a complete setup from one sweep candidate (steps 2-5)."""
         cfg = self._cfg
+        profile = self.profile
 
         # --- Step 2: displacement + MSS ---------------------------------
         mss = detect_mss(
@@ -138,7 +154,7 @@ class SilverBulletStrategy:
             swings,
             sweep,
             body_multiplier=cfg.displacement_body_mult,
-            min_displacement=self.points(cfg.min_displacement_points),
+            min_displacement=self.points(profile.min_displacement_points),
         )
         if mss is None:
             result.reject(f"Swept {sweep.pool} at {sweep.ts:%H:%M} but no displacement/MSS confirmed")
@@ -163,7 +179,7 @@ class SilverBulletStrategy:
 
         # --- Step 5a: structural stop -----------------------------------
         extreme = leg_extreme(candles, mss)
-        buffer = self.points(cfg.sl_buffer_points)
+        buffer = self.points(profile.sl_buffer_points)
         if sweep.direction is Direction.SELL:
             stop_loss = round_price(max(extreme, sweep.extreme) + buffer, self.point_size)
         else:
@@ -187,7 +203,7 @@ class SilverBulletStrategy:
             entry,
             stop_loss,
             min_rr=cfg.min_rr,
-            min_distance=self.points(cfg.min_sweep_penetration_points),
+            min_distance=self.points(profile.min_sweep_penetration_points),
         )
         if target is None:
             result.reject(
@@ -240,7 +256,7 @@ class SilverBulletStrategy:
         no qualifying gap; the same move on M5 frequently does show one, and ICT
         treats both as valid Silver Bullet entries.
         """
-        min_size = self.points(self._cfg.min_fvg_points)
+        min_size = self.points(self.profile.min_fvg_points)
         gaps = find_fvgs(
             candles,
             mss.direction,
@@ -276,7 +292,7 @@ class SilverBulletStrategy:
     def _htf_gap_pools(self, htf_candles: Sequence[Candle]) -> list[LiquidityPool]:
         """Unfilled HTF gaps expressed as draw-on-liquidity pools."""
         pools: list[LiquidityPool] = []
-        for gap in htf_unfilled_gaps(htf_candles, min_size=self.points(self._cfg.min_fvg_points * 2)):
+        for gap in htf_unfilled_gaps(htf_candles, min_size=self.points(self.profile.min_fvg_points * 2)):
             # A bearish HTF gap sits above price and draws it up (buy-side draw);
             # a bullish one sits below and draws price down.
             side = PoolSide.BUYSIDE if gap.direction is Direction.SELL else PoolSide.SELLSIDE

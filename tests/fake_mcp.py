@@ -129,23 +129,37 @@ class FakeConnection:
              "description": "Euro vs US Dollar"},
             {"symbolId": 41, "symbolName": "XAUUSD", "enabled": True,
              "description": "Gold vs US Dollar"},
+            {"symbolId": 10026, "symbolName": "BTCUSD", "enabled": True,
+             "description": "Bitcoin"},
         ]}
 
     def _get_balance(self, _args: dict) -> dict:
         return {"balance": int(self.balance * MONEY_SCALE),
                 "equity": int(self.balance * MONEY_SCALE), "currency": "USD"}
 
-    def _get_spot_prices(self, _args: dict) -> dict:
-        quote = fixtures.quote()
-        return {"prices": [{"symbolId": 41, "bid": _p(quote.bid), "ask": _p(quote.ask),
-                            "timestamp": int(fixtures.NOW.timestamp() * 1000)}]}
+    def _get_spot_prices(self, args: dict) -> dict:
+        requested = args.get("symbolId") or [41]
+        if not isinstance(requested, list):
+            requested = [requested]
+        quotes = {41: fixtures.quote(), 10026: fixtures.btc_quote()}
+        prices = []
+        for symbol_id in requested:
+            quote = quotes.get(symbol_id)
+            if quote is None:
+                continue
+            prices.append({"symbolId": symbol_id, "bid": _p(quote.bid), "ask": _p(quote.ask),
+                           "timestamp": int((quote.ts or fixtures.NOW).timestamp() * 1000)})
+        return {"prices": prices}
 
     def _get_trendbars(self, args: dict) -> dict:
-        series = {
-            "M_1": fixtures.m1_series(),
-            "M_5": fixtures.m5_history(),
-            "H_1": fixtures.h1_history(),
-        }.get(args.get("period"), [])
+        by_symbol = {
+            41: {"M_1": fixtures.m1_series, "M_5": fixtures.m5_history,
+                 "H_1": fixtures.h1_history},
+            10026: {"M_1": fixtures.btc_m1_series, "M_5": fixtures.btc_m5_history,
+                    "H_1": fixtures.btc_h1_history},
+        }
+        builder = by_symbol.get(args.get("symbolId"), {}).get(args.get("period"))
+        series = builder() if builder else []
         return {
             "symbolId": args.get("symbolId"),
             "period": args.get("period"),

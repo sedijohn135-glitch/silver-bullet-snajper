@@ -9,6 +9,7 @@ step - rounding up would quietly breach the risk limit on every trade.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Optional
 
 from utils.logging import get_logger
 from utils.prices import round_to_step
@@ -39,6 +40,8 @@ def calculate_position_size(
     volume_step: float,
     min_volume: float,
     max_volume: float,
+    entry_price: Optional[float] = None,
+    max_notional_leverage: float = 0.0,
 ) -> SizingResult:
     """Lots to trade for ``risk_pct`` of ``balance`` behind ``stop_distance``.
 
@@ -71,6 +74,27 @@ def calculate_position_size(
     if lots > max_volume:
         lots = round_to_step(max_volume, volume_step, mode="down")
         note = f"clamped to the {max_volume} lot maximum"
+
+    # Notional sanity check - a backstop against a *scale* failure.
+    #
+    # If price-scale auto-detection ever picks the wrong divisor, entry_price
+    # arrives as 8,006,716,000 instead of 80,067 and every other number in this
+    # function still looks perfectly reasonable. Position value is the one place
+    # that error becomes obvious, so it is checked before the order is built.
+    #
+    # It does NOT validate contract_size: that value is what the check is
+    # computed *from*, so a subtly wrong one passes. The symbol listing does not
+    # publish contract size, so it must be confirmed against the broker's own
+    # symbol specification - the start-up log prints the value in use.
+    if max_notional_leverage > 0 and entry_price:
+        notional = lots * contract_size * entry_price
+        if notional > balance * max_notional_leverage:
+            return SizingResult(
+                0.0, risk_amount, 0.0, risk_per_lot, False,
+                f"Position notional {notional:,.0f} is {notional / balance:.0f}x the "
+                f"{balance:,.2f} balance, above the {max_notional_leverage:.0f}x ceiling - "
+                f"check CONTRACT_SIZE for this symbol before trading it",
+            )
 
     actual_risk = lots * risk_per_lot
     return SizingResult(lots, risk_amount, actual_risk, risk_per_lot, True, note)

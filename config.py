@@ -156,7 +156,10 @@ class Config:
     kill_switch: bool = False
 
     # --- instrument -------------------------------------------------------
-    symbol: str = "XAUUSD"
+    symbol: str = "XAUUSD"              # weekday instrument (kept for compatibility)
+    weekend_symbol: str = "BTCUSD"      # traded Sat/Sun, when the weekday market is shut
+    weekend_trading: bool = True
+    profiles: dict = field(default_factory=dict)   # name -> SymbolProfile
     point_size: float = 0.01              # 1 point; 1 pip = 10 points on gold
     contract_size: float = 100.0          # ounces per 1.00 lot
     volume_step: float = 0.01
@@ -177,6 +180,7 @@ class Config:
     sl_buffer_points: float = 20.0
     include_open_pnl_in_drawdown: bool = True
     min_account_balance: float = 0.0
+    max_notional_leverage: float = 500.0  # sanity ceiling on position value
 
     # --- strategy ---------------------------------------------------------
     entry_timeframe: str = "M1"
@@ -240,6 +244,8 @@ def load_config() -> Config:
         allow_live_environment=env_bool("ALLOW_LIVE_ENVIRONMENT", False),
         kill_switch=env_bool("KILL_SWITCH", False),
         symbol=env_str("SYMBOL", "XAUUSD").upper(),
+        weekend_symbol=env_str("WEEKEND_SYMBOL", "BTCUSD").upper(),
+        weekend_trading=env_bool("WEEKEND_TRADING", True),
         point_size=env_float("POINT_SIZE", 0.01, minimum=1e-8),
         contract_size=env_float("CONTRACT_SIZE", 100.0, minimum=1e-8),
         volume_step=env_float("VOLUME_STEP", 0.01, minimum=1e-8),
@@ -259,6 +265,7 @@ def load_config() -> Config:
         sl_buffer_points=env_float("SL_BUFFER_POINTS", 20.0, minimum=0.0),
         include_open_pnl_in_drawdown=env_bool("INCLUDE_OPEN_PNL_IN_DRAWDOWN", True),
         min_account_balance=env_float("MIN_ACCOUNT_BALANCE", 0.0, minimum=0.0),
+        max_notional_leverage=env_float("MAX_NOTIONAL_LEVERAGE", 500.0, minimum=0.0),
         entry_timeframe=env_str("ENTRY_TIMEFRAME", "M1").upper(),
         structure_timeframe=env_str("STRUCTURE_TIMEFRAME", "M5").upper(),
         htf_timeframe=env_str("HTF_TIMEFRAME", "H1").upper(),
@@ -287,4 +294,59 @@ def load_config() -> Config:
         raise ConfigError("MIN_VOLUME must not exceed MAX_VOLUME")
     if cfg.sane_price_min >= cfg.sane_price_max:
         raise ConfigError("SANE_PRICE_MIN must be below SANE_PRICE_MAX")
+
+    object.__setattr__(cfg, "profiles", _load_profiles(cfg))
     return cfg
+
+
+#: Global env vars that used to configure the single symbol. They still work,
+#: but they now apply **only to the weekday instrument** - applying a 35-point
+#: spread cap to BTC would reject every trade it ever saw.
+_LEGACY_GLOBALS: dict[str, str] = {
+    "point_size": "POINT_SIZE",
+    "contract_size": "CONTRACT_SIZE",
+    "volume_step": "VOLUME_STEP",
+    "min_volume": "MIN_VOLUME",
+    "max_volume": "MAX_VOLUME",
+    "max_spread_points": "MAX_SPREAD_POINTS",
+    "sl_buffer_points": "SL_BUFFER_POINTS",
+    "min_fvg_points": "MIN_FVG_POINTS",
+    "min_displacement_points": "MIN_DISPLACEMENT_POINTS",
+    "min_sweep_penetration_points": "MIN_SWEEP_PENETRATION_POINTS",
+    "equal_level_tolerance_points": "EQUAL_LEVEL_TOLERANCE_POINTS",
+    "sane_price_min": "SANE_PRICE_MIN",
+    "sane_price_max": "SANE_PRICE_MAX",
+}
+
+
+def _load_profiles(cfg: "Config") -> dict:
+    """Build the profile for every instrument this bot may trade.
+
+    Precedence, lowest first: the built-in profile, then the legacy global env
+    vars (weekday symbol only), then `<SYMBOL>_<FIELD>` overrides.
+    """
+    from symbols import OVERRIDABLE, apply_overrides, profile_for
+
+    names = [n for n in (cfg.symbol, cfg.weekend_symbol) if n]
+    profiles: dict = {}
+    for name in dict.fromkeys(names):
+        profile = profile_for(name)
+
+        if name == cfg.symbol:
+            legacy = {
+                field_name: _raw(env_name)
+                for field_name, env_name in _LEGACY_GLOBALS.items()
+                if _raw(env_name) is not None
+            }
+            profile = apply_overrides(
+                profile,
+                {k: env_float(_LEGACY_GLOBALS[k], getattr(profile, k)) for k in legacy},
+            )
+
+        overrides = {}
+        for field_name in OVERRIDABLE:
+            env_name = f"{name}_{field_name.upper()}"
+            if _raw(env_name) is not None:
+                overrides[field_name] = env_float(env_name, getattr(profile, field_name))
+        profiles[name] = apply_overrides(profile, overrides)
+    return profiles

@@ -99,10 +99,11 @@ class OrderExecutor:
         narrative = "\n".join(f"• {esc(line)}" for line in setup.narrative)
         await self._notifier.send(
             f"{header}\n"
-            f"{arrow} <b>{esc(setup.direction.value)} LIMIT {self._cfg.symbol}</b> "
+            f"{arrow} <b>{esc(setup.direction.value)} LIMIT {esc(self._gateway.active_name)}</b> "
             f"{sizing.lots} lots\n"
             f"<b>Entry</b> {setup.entry:.2f}\n"
-            f"<b>SL</b> {setup.stop_loss:.2f}  ({setup.stop_distance / self._cfg.point_size:.0f}pt)\n"
+            f"<b>SL</b> {setup.stop_loss:.2f}  "
+            f"({setup.stop_distance / self._gateway.point_size:.0f}pt)\n"
             f"<b>TP</b> {setup.take_profit:.2f}  ({setup.risk_reward:.2f}R)\n"
             f"<b>Risk</b> {sizing.actual_risk:.2f} "
             f"({sizing.actual_risk / max(sizing.risk_amount, 1e-9) * self._cfg.risk_per_trade_pct:.2f}% "

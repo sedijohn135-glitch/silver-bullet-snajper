@@ -29,6 +29,7 @@ from mcp_client.transport import MCPConnection
 from models import (
     AccountSnapshot, Candle, Deal, PendingOrder, Position, Quote, SymbolInfo,
 )
+from symbols import SymbolProfile, profile_for
 from utils.logging import get_logger
 from utils.prices import Scale, resolve_money_scale, resolve_price_scale
 from utils.timeframes import get_timeframe
@@ -86,12 +87,47 @@ class CTraderGateway:
     def __init__(self, cfg: Config, connection: MCPConnection) -> None:
         self._cfg = cfg
         self._conn = connection
-        self.symbol: Optional[SymbolInfo] = None
-        self.price_scale = Scale(1.0, "fallback")
+        self.active_name: str = cfg.symbol
+        self.symbols: dict[str, SymbolInfo] = {}
         self.money_scale = Scale(1.0, "fallback")
-        self.point_size = cfg.point_size
+        self._scales: dict[str, Scale] = {}
+        self._point_sizes: dict[str, float] = {}
         self._volume_mode: str = cfg.volume_unit_mode
         self._warned: set[str] = set()
+
+    # -- active instrument -------------------------------------------------
+
+    @property
+    def symbol(self) -> Optional[SymbolInfo]:
+        return self.symbols.get(self.active_name)
+
+    @property
+    def profile(self) -> SymbolProfile:
+        """Contract mechanics and point thresholds for the active instrument."""
+        profiles = self._cfg.profiles or {}
+        return profiles.get(self.active_name) or profile_for(self.active_name)
+
+    @property
+    def price_scale(self) -> Scale:
+        return self._scales.get(self.active_name, Scale(1.0, "fallback"))
+
+    @property
+    def point_size(self) -> float:
+        return self._point_sizes.get(self.active_name, self.profile.point_size)
+
+    def set_active(self, name: str) -> None:
+        """Switch the instrument the gateway operates on."""
+        name = name.upper()
+        if name == self.active_name and name in self.symbols:
+            return
+        if name not in self.symbols:
+            raise ToolCallError(
+                f"{name} was not resolved at bootstrap "
+                f"(known: {sorted(self.symbols)}); cannot make it active."
+            )
+        self.active_name = name
+        log.info("Active instrument -> %s (id %s) | %s",
+                 name, self.symbols[name].symbol_id, self.profile.describe())
 
     # -- plumbing ----------------------------------------------------------
 
@@ -121,40 +157,51 @@ class CTraderGateway:
     # -- bootstrap ---------------------------------------------------------
 
     async def bootstrap(self) -> None:
-        """Resolve the symbol and pin down price/money scaling.
+        """Resolve every configured instrument and pin down scaling.
 
-        Must run after every (re)connect, before any sizing decision: a wrong
-        scale silently turns a 1% risk into a 1000% one.
+        Runs after each (re)connect, before any sizing decision: a wrong scale
+        silently turns a 1% risk into a 1000% one. Both the weekday and weekend
+        instruments are resolved up front so the daily switch costs nothing.
         """
-        self.symbol = await self.resolve_symbol(self._cfg.symbol)
-        log.info("Resolved %s -> symbolId=%s (%s)",
-                 self.symbol.name, self.symbol.symbol_id, self.symbol.description)
-
-        if self.symbol.digits:
-            derived = 10.0 ** (-self.symbol.digits)
-            if not math.isclose(derived, self._cfg.point_size, rel_tol=1e-9):
-                log.info("Point size from broker digits=%s -> %s (config said %s)",
-                         self.symbol.digits, derived, self._cfg.point_size)
-            self.point_size = derived
-        else:
-            self.point_size = self._cfg.point_size
-            log.info("Broker did not expose 'digits'; using configured POINT_SIZE=%s",
-                     self.point_size)
-
-        await self._detect_price_scale()
         await self._detect_money_scale()
 
-    async def _detect_price_scale(self) -> None:
-        payload = await self._raw_spot()
+        wanted = list(self._cfg.profiles or {self._cfg.symbol: None})
+        for name in wanted:
+            profile = (self._cfg.profiles or {}).get(name) or profile_for(name)
+            info = await self.resolve_symbol(name)
+            self.symbols[name] = info
+            self._point_sizes[name] = self._resolve_point_size(info, profile)
+            self._scales[name] = await self._detect_price_scale(info, profile)
+            log.info("Instrument ready | %s (id %s) | %s",
+                     info.name, info.symbol_id, profile.describe())
+
+        if self.active_name not in self.symbols and self.symbols:
+            self.active_name = next(iter(self.symbols))
+
+    def _resolve_point_size(self, info: SymbolInfo, profile: SymbolProfile) -> float:
+        """Prefer the broker's own digits; fall back to the profile."""
+        if info.digits:
+            derived = 10.0 ** (-info.digits)
+            if not math.isclose(derived, profile.point_size, rel_tol=1e-9):
+                log.info("%s point size from broker digits=%s -> %s (profile said %s)",
+                         info.name, info.digits, derived, profile.point_size)
+            return derived
+        log.info("%s: broker exposed no 'digits'; using profile point size %s",
+                 info.name, profile.point_size)
+        return profile.point_size
+
+    async def _detect_price_scale(self, info: SymbolInfo, profile: SymbolProfile) -> Scale:
+        payload = await self._raw_spot(info)
         samples = collect_numbers(find_list(payload, "prices", "spots", "quotes"),
                                   ("bid", "ask", "price"), limit=6)
-        self.price_scale = resolve_price_scale(
-            self._cfg.price_scale, samples, self._cfg.sane_price_min, self._cfg.sane_price_max
+        scale = resolve_price_scale(
+            self._cfg.price_scale, samples, profile.sane_price_min, profile.sane_price_max
         )
-        example = (samples[0] / self.price_scale.divisor) if samples else float("nan")
-        log.info("Price scale: divide by %s (%s) - e.g. %s -> %.2f",
-                 self.price_scale.divisor, self.price_scale.source,
+        example = (samples[0] / scale.divisor) if samples else float("nan")
+        log.info("%s price scale: divide by %s (%s) - e.g. %s -> %.2f",
+                 info.name, scale.divisor, scale.source,
                  samples[0] if samples else "n/a", example)
+        return scale
 
     async def _detect_money_scale(self) -> None:
         if not self.has(TOOL_BALANCE):
@@ -208,12 +255,12 @@ class CTraderGateway:
             f"({len(records)} symbols returned)."
         )
 
-    async def _raw_spot(self) -> Any:
-        symbol_id = self.symbol.symbol_id if self.symbol else None
+    async def _raw_spot(self, info: Optional[SymbolInfo] = None) -> Any:
+        info = info or self.symbol
         values: dict[str, Any] = {}
-        if symbol_id is not None:
-            values["symbol_id"] = symbol_id
-            values["symbol_name"] = self._cfg.symbol
+        if info is not None:
+            values["symbol_id"] = info.symbol_id
+            values["symbol_name"] = info.name
         return await self._call(TOOL_SPOT, values)
 
     async def get_quote(self) -> Quote:
@@ -226,7 +273,7 @@ class CTraderGateway:
                 record = candidate
                 break
         if record is None:
-            raise ToolCallError(f"No spot price returned for {self._cfg.symbol}")
+            raise ToolCallError(f"No spot price returned for {self.active_name}")
 
         bid = self.price_scale.apply(as_float(pick(record, "bid", "bidPrice"), None))
         ask = self.price_scale.apply(as_float(pick(record, "ask", "askPrice"), None))
@@ -275,7 +322,7 @@ class CTraderGateway:
 
         base: dict[str, Any] = {
             "symbol_id": self.symbol.symbol_id if self.symbol else None,
-            "symbol_name": self._cfg.symbol,
+            "symbol_name": self.active_name,
             "period": Candidates(tf.aliases),
         }
 
@@ -309,10 +356,10 @@ class CTraderGateway:
                 break
 
         if not candles:
-            raise ToolCallError(f"No {timeframe} candles returned for {self._cfg.symbol}")
+            raise ToolCallError(f"No {timeframe} candles returned for {self.active_name}")
         if len(candles) < count * 0.5:
             self._warn_once(
-                f"thin-{timeframe}",
+                f"thin-{self.active_name}-{timeframe}",
                 "Only %d %s bars available (asked for %d) - market may be closed.",
                 len(candles), timeframe, count,
             )
@@ -486,18 +533,20 @@ class CTraderGateway:
 
     def lots_to_wire(self, lots: float) -> float:
         mode = self.resolve_volume_mode()
+        contract = self.profile.contract_size
         if mode == "units":
-            return lots * self._cfg.contract_size
+            return lots * contract
         if mode == "centiunits":
-            return lots * self._cfg.contract_size * 100.0
+            return lots * contract * 100.0
         return lots
 
     def _volume_to_lots(self, wire_volume: float) -> float:
         mode = self.resolve_volume_mode()
-        if mode == "units" and self._cfg.contract_size:
-            return wire_volume / self._cfg.contract_size
-        if mode == "centiunits" and self._cfg.contract_size:
-            return wire_volume / (self._cfg.contract_size * 100.0)
+        contract = self.profile.contract_size
+        if mode == "units" and contract:
+            return wire_volume / contract
+        if mode == "centiunits" and contract:
+            return wire_volume / (contract * 100.0)
         return wire_volume
 
     def _price_field_mode(self, canonical: str) -> str:
@@ -536,7 +585,7 @@ class CTraderGateway:
         reference = request.price
         values: dict[str, Any] = {
             "symbol_id": self.symbol.symbol_id if self.symbol else None,
-            "symbol_name": self.symbol.name if self.symbol else self._cfg.symbol,
+            "symbol_name": self.symbol.name if self.symbol else self.active_name,
             "order_type": ORDER_TYPE_CANDIDATES.get(request.order_type,
                                                     Candidates.of(request.order_type)),
             "trade_side": SIDE_CANDIDATES.get(request.side, Candidates.of(request.side)),

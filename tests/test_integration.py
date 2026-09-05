@@ -78,7 +78,7 @@ async def test_paper_mode_runs_the_whole_pipeline_without_sending_an_order(monke
     await bot._tick()
 
     assert not connection.orders, "paper mode must never call create_order"
-    label = "SB-20260904-AFTERNOON"
+    label = "SB-XAUUSD-20260904-AFTERNOON"
     assert label in bot.state.executed_windows
     assert bot.state.trades_today == 1
 
@@ -98,7 +98,7 @@ async def test_live_mode_submits_a_schema_bound_limit_order(monkeypatch):
     assert order["limitPrice"] == pytest.approx(4419.50, abs=0.01)
     assert order["stopLoss"] == pytest.approx(4431.00, abs=0.01)     # 20pt beyond the wick
     assert order["takeProfit"] == pytest.approx(4392.00, abs=0.01)
-    assert order["label"] == "SB-20260904-AFTERNOON"
+    assert order["label"] == "SB-XAUUSD-20260904-AFTERNOON"
     # 1% of 10,000 = $100 behind an 11.50 stop on 100oz/lot -> 0.08 lots.
     assert order["volume"] == pytest.approx(0.08)
 
@@ -120,7 +120,7 @@ async def test_a_redeployed_bot_sees_its_own_resting_order(monkeypatch):
     """In-memory state is gone, but the broker still holds the labelled order."""
     resting = [{
         "orderId": "o-1", "symbolId": 41, "symbolName": "XAUUSD", "tradeSide": "SELL",
-        "volume": 0.08, "limitPrice": 441950000, "label": "SB-20260904-AFTERNOON",
+        "volume": 0.08, "limitPrice": 441950000, "label": "SB-XAUUSD-20260904-AFTERNOON",
         "orderType": "LIMIT",
     }]
     connection = FakeConnection(balance=10_000.0, pending=resting)
@@ -177,7 +177,7 @@ async def test_outside_the_window_nothing_is_analysed(monkeypatch):
 async def test_stale_order_from_an_earlier_window_is_cancelled(monkeypatch):
     stale = [{
         "orderId": "o-old", "symbolId": 41, "symbolName": "XAUUSD", "tradeSide": "SELL",
-        "volume": 0.05, "limitPrice": 442000000, "label": "SB-20260904-MORNING",
+        "volume": 0.05, "limitPrice": 442000000, "label": "SB-XAUUSD-20260904-MORNING",
         "orderType": "LIMIT",
     }]
     connection = FakeConnection(balance=10_000.0, pending=stale)

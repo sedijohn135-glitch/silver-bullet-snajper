@@ -97,7 +97,7 @@ class TradeMonitor:
         """
         exit_price = next((d.price for d in reversed(deals) if d.price), None)
         if position and exit_price is not None:
-            tolerance = self._cfg.point_size * 30
+            tolerance = self._gateway.point_size * 30
             if position.take_profit and abs(exit_price - position.take_profit) <= tolerance:
                 return "TAKE PROFIT"
             if position.stop_loss and abs(exit_price - position.stop_loss) <= tolerance:
@@ -114,7 +114,7 @@ class TradeMonitor:
     # -- notifications -----------------------------------------------------
 
     async def _notify_fill(self, position: Position) -> None:
-        symbol = position.symbol_name or self._cfg.symbol
+        symbol = position.symbol_name or self._gateway.active_name
         lines = [
             "✅ <b>ORDER FILLED</b>",
             f"{esc(position.side)} {position.volume} {esc(symbol)}"

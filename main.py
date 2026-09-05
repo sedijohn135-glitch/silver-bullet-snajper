@@ -39,6 +39,19 @@ def build_notifier(cfg: Config) -> TelegramNotifier:
     return NullNotifier()
 
 
+def announce_instruments(cfg: Config) -> None:
+    """Print the trading calendar and the exact contract mechanics in use.
+
+    CONTRACT_SIZE cannot be read from the API - the symbol listing does not
+    publish it - so it is printed here for the operator to check against the
+    broker's symbol specification before any order is sized from it.
+    """
+    weekend = f"{cfg.weekend_symbol} Sat/Sun" if cfg.weekend_trading else "idle at weekends"
+    log.info("Trading calendar: %s Mon-Fri, %s", cfg.symbol, weekend)
+    for profile in (cfg.profiles or {}).values():
+        log.info("  profile | %s", profile.describe())
+
+
 def announce_environment(cfg: Config, token: TokenInfo) -> None:
     """Make the account environment impossible to miss in the logs.
 
@@ -90,6 +103,7 @@ async def run() -> int:
 
     token = decode_token(cfg.mcp_token)
     announce_environment(cfg, token)
+    announce_instruments(cfg)
 
     notifier = build_notifier(cfg)
     await notifier.start()

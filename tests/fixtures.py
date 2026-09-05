@@ -8,6 +8,7 @@ FVG, and the previous-day low sits far enough below to pay better than 2R.
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+from typing import Iterable
 
 from models import Candle, Quote
 
@@ -109,3 +110,59 @@ def m1_series() -> list[Candle]:
 def quote(bid: float = 4418.10, ask: float = 4418.40) -> Quote:
     """A 30-point spread - inside the 35-point guard."""
     return Quote(symbol_id=41, bid=bid, ask=ask, ts=NOW)
+
+
+# ---------------------------------------------------------------------------
+# BTCUSD - the same Silver Bullet geometry, at Bitcoin's scale
+# ---------------------------------------------------------------------------
+#
+# Rather than invent a second scenario, the gold series is projected onto BTC:
+# every price is mapped through `80,000 + (gold - 4425) * 85`. The 85x factor is
+# the measured ratio of median M1 body size between the two instruments on the
+# live feed, so the resulting bars have realistic BTC volatility and every
+# point-based threshold in the BTCUSD profile is exercised at its true magnitude.
+
+BTC_ANCHOR = 80_000.0
+GOLD_ANCHOR = 4_425.0
+BTC_FACTOR = 85.0
+
+#: The BTC series is also shifted one day forward, onto Saturday 2026-09-05 -
+#: the whole point of trading it is that the weekend is when gold is shut.
+BTC_DAY_OFFSET = timedelta(days=1)
+BTC_NOW = NOW + BTC_DAY_OFFSET
+BTC_WINDOW_START = WINDOW_START + BTC_DAY_OFFSET
+
+
+def to_btc(gold_price: float) -> float:
+    return round(BTC_ANCHOR + (gold_price - GOLD_ANCHOR) * BTC_FACTOR, 2)
+
+
+def _project(candles: Iterable[Candle]) -> list[Candle]:
+    return [
+        Candle(ts=c.ts + BTC_DAY_OFFSET, open=to_btc(c.open), high=to_btc(c.high),
+               low=to_btc(c.low), close=to_btc(c.close), volume=c.volume)
+        for c in candles
+    ]
+
+
+def btc_m1_series() -> list[Candle]:
+    return _project(m1_series())
+
+
+def btc_m5_history() -> list[Candle]:
+    return _project(m5_history())
+
+
+def btc_h1_history() -> list[Candle]:
+    return _project(h1_history())
+
+
+def btc_quote() -> Quote:
+    """A 5.00 USD spread - 500 points, inside the 700-point BTCUSD guard.
+
+    The spread is set independently rather than projected: scaling gold's 0.30
+    spread by 85 would give 25 USD, which is nothing like what BTC actually
+    quotes (the live book showed 5.00).
+    """
+    mid = to_btc(4418.25)
+    return Quote(symbol_id=10026, bid=round(mid - 2.5, 2), ask=round(mid + 2.5, 2), ts=BTC_NOW)

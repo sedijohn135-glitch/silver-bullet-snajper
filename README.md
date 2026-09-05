@@ -57,6 +57,7 @@ main.py                  boot, signal handling, environment announcement
 healthcheck.py           container probe used by the Dockerfile HEALTHCHECK
 config.py                every tunable, validated at start-up
 models.py                Candle / Quote / Position / Deal (already unscaled)
+symbols.py               per-instrument profiles + weekday/weekend calendar
 
 mcp_client/
   transport.py           supervised Streamable HTTP session + reconnection
@@ -161,6 +162,44 @@ Two of these shaped the design directly:
 
 ---
 
+## Instruments and the trading calendar
+
+| Day | Instrument | Why |
+|---|---|---|
+| Mon–Fri | `XAUUSD` | Gold trades the FX week. |
+| Sat–Sun | `BTCUSD` | Gold is shut from Friday evening to Sunday evening; crypto runs 24/7. |
+
+Set `WEEKEND_TRADING=false` to idle at weekends instead. The instrument is
+chosen from the **local (Europe/Tirane) date**, so a Saturday window is a
+Saturday window regardless of what UTC thinks.
+
+Every threshold in this bot is expressed in **points**, and a point means very
+different things per market. Measured on the live feed:
+
+| | XAUUSD | BTCUSD |
+|---|---|---|
+| Price | ~4,431 | ~80,067 |
+| Median M1 body | 35 points | 2,960 points |
+| Live spread | 40 points | 500 points |
+| Contract size | 100 oz/lot | 1 BTC/lot |
+
+So gold's 35-point spread cap would reject **every** BTC trade, and gold's
+contract size would size a BTC position 100× too large. Each instrument
+therefore carries its own `SymbolProfile` (`symbols.py`) holding contract
+mechanics and every point-based threshold. The BTC values were derived from bars
+pulled off the live server, keeping the same *relative* meaning each has for
+gold.
+
+Overrides use the `<SYMBOL>_<FIELD>` form — `BTCUSD_MAX_SPREAD_POINTS=900`. The
+legacy global variables (`MAX_SPREAD_POINTS`, `CONTRACT_SIZE`, …) still work but
+apply **only to the weekday instrument**, so an existing deployment keeps its
+gold configuration without leaking it onto crypto.
+
+> **Confirm `CONTRACT_SIZE` per symbol.** It is the one input the API does not
+> publish — the symbol listing carries no `lotSize` — so the bot prints the
+> value in use at start-up (`profile | BTCUSD: … contract=1.0 …`). Check it
+> against your cTrader symbol specification before trading a new instrument.
+
 ## The strategy
 
 Analysis runs **only** inside three one-hour windows, in Albania local time via
@@ -220,8 +259,9 @@ records *why* the first was rejected, so a quiet window still explains itself:
 | **Position sizing** | Exactly `RISK_PER_TRADE_PCT` (1.0%) of the **live** balance, divided by the actual structural stop distance. `get_balance` is called before every sizing calculation — a cached balance never sizes a position. Lots round **down** onto the volume step; rounding up would breach the limit on every trade. |
 | **Below the minimum lot** | The trade is **refused**, not rounded up. If 1% risk implies 0.004 lots, taking the 0.01 minimum would risk 2.5×the limit. |
 | **Daily drawdown** | Trading halts for the rest of the day at `DAILY_MAX_DRAWDOWN_PCT` (3.0%). Realised P&L is recomputed from the broker's own `get_deals` on every pass, never tallied in memory — a redeploy must not let the bot forget it is already down. Floating P&L on open positions is included by default. |
-| **One trade per window** | Enforced by writing a window label (`SB-20260904-AFTERNOON`) onto every order and reading it back off `get_positions`/`get_pending_orders`. In-memory state resets on redeploy; the broker's order book does not. |
-| **Spread guard** | Entry is blocked above `MAX_SPREAD_POINTS` (35 points = 3.5 pips), checked from `get_spot_prices` — and re-checked immediately before submission, because a minute can pass between analysis and execution. |
+| **One trade per window** | Enforced by writing a window label (`SB-BTCUSD-20260905-AFTERNOON`) onto every order and reading it back off `get_positions`/`get_pending_orders`. In-memory state resets on redeploy; the broker's order book does not. |
+| **Notional ceiling** | A position whose value exceeds `MAX_NOTIONAL_LEVERAGE` × balance is refused. This is a backstop against a *price-scale* failure: if auto-detection ever picked the wrong divisor, entry price arrives as 8,006,716,000 instead of 80,067 and every other number still looks reasonable. |
+| **Spread guard** | Entry is blocked above the active profile's `max_spread_points` (35 for gold, 700 for BTC), checked from `get_spot_prices` — and re-checked immediately before submission, because a minute can pass between analysis and execution. |
 | **Kill switch** | `KILL_SWITCH=true` blocks all new orders without a redeploy. |
 | **Stale orders** | Unfilled limits are cancelled once their window closes — an FVG entry that was not taken inside its window has lost its premise. |
 
@@ -272,7 +312,7 @@ reading before going live:
 ## Testing
 
 ```bash
-pytest            # 35 tests: strategy, risk, transport, and full-stack integration
+pytest            # 49 tests: strategy, risk, transport, instruments, integration
 ```
 
 The integration tests run the entire bot — gateway, strategy, guards, sizing,
