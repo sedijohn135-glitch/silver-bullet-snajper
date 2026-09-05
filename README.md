@@ -293,6 +293,22 @@ back to the log — a dead notifier is never a reason to stop managing live risk
 
 ## Observability
 
+On every connect the bot runs a **preflight**: it builds one real `create_order`
+payload per instrument at the minimum permitted size and logs it *without
+sending it*.
+
+```
+PREFLIGHT BTCUSD (NOT sent) | min 0.01 lots -> wire volume 1 | {'symbolId': 10026,
+  'orderType': 'LIMIT', 'tradeSide': 'SELL', 'volume': 1, 'limitPrice': 79478.75, ...}
+```
+
+The order payload is assembled from the live schema, so a mistake in it would
+otherwise only surface at the exact moment a setup appears — the worst possible
+time to learn that volume rounds to zero. The preflight turns that unknown into a
+log line at boot, and raises an alert if volume resolves to `0`. It proves the
+payload is well-formed and shows the real numbers; only a live order proves the
+broker accepts it.
+
 `GET /status` (when `PORT` is set) returns connection state, session id, tool
 list, call/error/timeout counters, last error, executed windows, and the most
 recent rejection reasons. `GET /health` returns 503 while the MCP session is
@@ -322,7 +338,7 @@ reading before going live:
 ## Testing
 
 ```bash
-pytest            # 53 tests: strategy, risk, transport, instruments, integration
+pytest            # 54 tests: strategy, risk, transport, instruments, integration
 ```
 
 The integration tests run the entire bot — gateway, strategy, guards, sizing,

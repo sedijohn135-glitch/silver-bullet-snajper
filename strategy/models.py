@@ -141,10 +141,12 @@ class TradeSetup:
     stop_loss: float
     take_profit: float
     risk_reward: float
-    sweep: Sweep
-    mss: MarketStructureShift
-    fvg: FairValueGap
-    target: LiquidityPool
+    # Optional so a boot-time preflight can build a representative order
+    # without inventing a fake sweep/MSS/FVG chain to go with it.
+    sweep: Optional[Sweep]
+    mss: Optional[MarketStructureShift]
+    fvg: Optional[FairValueGap]
+    target: Optional[LiquidityPool]
     window: str
     narrative: list[str] = field(default_factory=list)
 

@@ -29,9 +29,11 @@ from risk.guards import (
     GuardVerdict, check_balance, check_daily_drawdown, check_environment,
     check_kill_switch, check_spread, check_window_exposure, first_blocker,
 )
-from risk.sizing import calculate_position_size
+from risk.sizing import SizingResult, calculate_position_size
+from strategy.models import Direction, TradeSetup
 from strategy.silver_bullet import MarketSnapshot, SilverBulletStrategy
 from utils.logging import get_logger
+from utils.prices import round_price
 from symbols import symbol_for_day
 from utils.sessions import (
     active_window, local_day_start_utc, next_window_start, now_utc, to_local, window_key,
@@ -112,6 +114,7 @@ class SilverBulletBot:
             self._bootstrapped_for = self.connection.stats.connects
             self._active_symbol = None
             await self._announce_startup()
+            await self._preflight()
 
         # XAUUSD is shut from Friday evening to Sunday evening while BTCUSD runs
         # continuously, so the instrument is chosen per local day.
@@ -253,6 +256,72 @@ class SilverBulletBot:
             self.store.save(self.state)
 
     # -- helpers -----------------------------------------------------------
+
+    async def _preflight(self) -> None:
+        """Build - and deliberately never send - one order per instrument.
+
+        The order payload is assembled from the live schema, so a mistake in it
+        only surfaces at the exact moment a setup appears, which is the worst
+        possible time to discover that (say) volume rounds to zero. This runs the
+        whole construction path at boot against the smallest permitted size and
+        prints the result, turning an unknown into a log line the operator can
+        check immediately.
+
+        It proves the payload is well-formed and shows the real numbers. It does
+        not prove the broker will accept it - only a live order does that.
+        """
+        for name in list(self.gateway.symbols):
+            try:
+                self.gateway.set_active(name)
+                profile = self.gateway.profile
+                quote = await self.gateway.get_quote()
+                step, minimum, _ = self._volume_limits()
+
+                # A sell limit parked far above the market: representative in
+                # shape, and impossible to fill even if it were sent.
+                stop_gap = profile.points_to_price(profile.sl_buffer_points)
+                entry = round_price(quote.ask + stop_gap * 5, self.gateway.point_size)
+                stop_loss = round_price(entry + stop_gap, self.gateway.point_size)
+                take_profit = round_price(entry - stop_gap * 2, self.gateway.point_size)
+
+                request = self.executor.build_request(
+                    TradeSetup(
+                        direction=Direction.SELL, entry=entry, stop_loss=stop_loss,
+                        take_profit=take_profit, risk_reward=2.0, sweep=None, mss=None,
+                        fvg=None, target=None, window="PREFLIGHT",
+                    ),
+                    SizingResult(minimum, 0.0, 0.0, 0.0, True),
+                    f"{self._cfg.order_label_prefix}-PREFLIGHT",
+                )
+                payload = self.gateway.describe_order_payload(request)
+                log.info(
+                    "PREFLIGHT %s (NOT sent) | min %s lots -> wire volume %r | %s",
+                    name, minimum, payload.get(self._order_volume_field(), "?"), payload,
+                )
+                if payload.get(self._order_volume_field()) in (0, None):
+                    log.error(
+                        "PREFLIGHT %s: volume resolves to %r - no order could ever be "
+                        "placed. Set VOLUME_UNIT_MODE explicitly.",
+                        name, payload.get(self._order_volume_field()),
+                    )
+                    await self._notifier.send(
+                        f"🚨 <b>Preflight failed</b> ({esc(name)})\n"
+                        f"create_order volume resolves to "
+                        f"<code>{esc(payload.get(self._order_volume_field()))}</code> - "
+                        f"no order can be placed. Set VOLUME_UNIT_MODE.",
+                        dedup_key=f"preflight-volume-{name}",
+                    )
+            except Exception as exc:  # noqa: BLE001 - a preflight must never stop the bot
+                log.error("PREFLIGHT %s could not build an order payload: %s", name, exc)
+                await self._notifier.send(
+                    f"⚠️ <b>Preflight failed</b> ({esc(name)})\n<code>{esc(str(exc)[:300])}</code>",
+                    dedup_key=f"preflight-{name}",
+                )
+        # Leave the active instrument to the normal daily selection.
+        self._active_symbol = None
+
+    def _order_volume_field(self) -> str:
+        return self.gateway._property_for("volume") or "volume"
 
     def _select_instrument(self, now: datetime) -> bool:
         """Point the gateway and strategy at today's instrument.

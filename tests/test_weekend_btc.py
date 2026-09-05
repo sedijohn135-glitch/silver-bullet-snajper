@@ -217,3 +217,23 @@ def test_a_value_the_schema_cannot_represent_is_dropped_not_sent():
     assert bind_arguments(tool, {"expiry": "2026-09-05T21:01:27Z"}) == {}
     bound = bind_arguments(tool, {"expiry": Candidates.of(1788634887000, "2026-09-05T21:01:27Z")})
     assert bound == {"expirationTimestamp": 1788634887000}
+
+
+@pytest.mark.asyncio
+async def test_preflight_prints_a_real_payload_for_every_instrument(monkeypatch, caplog):
+    """Boot-time proof that an order can be built, before any setup exists."""
+    import logging
+
+    connection = FakeConnection(balance=10_000.0)
+    bot = make_bot(monkeypatch, connection, TRADING_MODE="live")
+    await bot.gateway.bootstrap()
+
+    with caplog.at_level(logging.INFO, logger="engine"):
+        await bot._preflight()
+
+    assert not connection.orders, "preflight must never send an order"
+    lines = [r.getMessage() for r in caplog.records if "PREFLIGHT" in str(r.msg)]
+    assert any("XAUUSD" in line for line in lines)
+    assert any("BTCUSD" in line for line in lines)
+    # Minimum size must survive the integer volume field, not round to zero.
+    assert all("wire volume 0" not in line for line in lines), lines
