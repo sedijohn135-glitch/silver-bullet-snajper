@@ -167,7 +167,14 @@ class AnalysisResult:
     candles_used: int = 0
 
     def reject(self, reason: str) -> "AnalysisResult":
-        self.rejections.append(reason)
+        """Record why a candidate failed, without repeating an identical reason.
+
+        Several sweep candidates commonly fail the same way ("no unmitigated FVG
+        in the leg"), and eight copies of one sentence tells the reader nothing
+        the first copy did not.
+        """
+        if reason not in self.rejections:
+            self.rejections.append(reason)
         return self
 
     @property

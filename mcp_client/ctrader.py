@@ -23,7 +23,7 @@ from mcp_client.parsing import (
     normalize_side, parse_timestamp, pick,
 )
 from mcp_client.schema import (
-    Candidates, ToolSpec, bind_arguments, normalize, wants_units,
+    Candidates, ToolSpec, bind_arguments, declared_types, normalize, wants_units,
 )
 from mcp_client.transport import MCPConnection
 from models import (
@@ -334,6 +334,13 @@ class CTraderGateway:
             now = datetime.now(tz=timezone.utc)
             span = min(tf.seconds * count * span_multiplier, 720 * 3600 - 60)
             start = now - timedelta(seconds=span)
+            # `count` goes in alongside from/to: without it the server applies
+            # its own default (100) and silently truncates the history, which
+            # looks exactly like a closed market. Some builds reject the
+            # combination, so the plain from/to form is kept as a fallback.
+            if has_from and has_to and has_count:
+                attempts.append({**base, "from_ts": _iso(start), "to_ts": _iso(now),
+                                 "count": count})
             if has_from and has_to:
                 attempts.append({**base, "from_ts": _iso(start), "to_ts": _iso(now)})
             if has_to and has_count:
@@ -349,8 +356,12 @@ class CTraderGateway:
                 except (ToolCallError, ToolUnavailable) as exc:
                     log.debug("trendbars attempt %s failed: %s", sorted(values), str(exc)[:160])
                     continue
-                candles = self._to_candles(find_list(payload, "trendbars", "bars", "candles", "data"))
-                if candles:
+                got = self._to_candles(find_list(payload, "trendbars", "bars", "candles", "data"))
+                # Keep the richest result: an attempt that succeeds but returns
+                # a truncated series should not stop us trying a better shape.
+                if len(got) > len(candles):
+                    candles = got
+                if len(candles) >= count * 0.9:
                     break
             if len(candles) >= count * 0.6:
                 break
@@ -515,12 +526,29 @@ class CTraderGateway:
         prop, schema = self._volume_property()
         if prop is None:
             return "lots"
-        verdict = wants_units(prop, schema)
+
         text = f"{prop} {schema.get('description', '')}".lower()
-        if verdict is True:
-            mode = "centiunits" if "cent" in text or "1/100" in text else "units"
-        elif verdict is False:
+        verdict = wants_units(prop, schema)
+        is_integer = "integer" in declared_types(schema)
+
+        if verdict is False and not is_integer:
             mode = "lots"
+        elif verdict is True:
+            mode = "centiunits" if ("cent" in text or "1/100" in text or is_integer) else "units"
+        elif is_integer:
+            # Decisive: lot sizes are fractional (0.01 steps), so a field the
+            # schema declares as an integer cannot be carrying lots. cTrader's
+            # own convention for an integer volume is 1/100 of a unit, so 0.10
+            # lots of a 1-unit contract is 10, not 0. Without this the value
+            # rounds to zero and every order is rejected.
+            mode = "centiunits"
+            self._warn_once(
+                "volume-mode",
+                "create_order.%s is declared %s - lots cannot be integers, so volume "
+                "is being sent as cTrader centi-units (lots x contract_size x 100). "
+                "Override with VOLUME_UNIT_MODE if your server differs.",
+                prop, declared_types(schema) or "integer",
+            )
         else:
             mode = "lots"
             self._warn_once(
@@ -597,8 +625,34 @@ class CTraderGateway:
             "comment": request.comment or request.label,
         }
         if request.expiry is not None:
-            values["expiry"] = _iso(request.expiry)
-        return bind_arguments(tool, values, extras=self._cfg_extra_order_fields())
+            # Servers differ: some want epoch milliseconds (integer), others an
+            # ISO string. Offer both and let the schema pick; if neither fits,
+            # the binder drops the optional field rather than sending a value
+            # the server will reject.
+            values["expiry"] = Candidates.of(
+                int(request.expiry.timestamp() * 1000), _iso(request.expiry)
+            )
+            # An expiring order must say so, or the broker treats it as GTC.
+            values["time_in_force"] = Candidates.of("GOOD_TILL_DATE", "GTD")
+
+        arguments = bind_arguments(tool, values, extras=self._cfg_extra_order_fields())
+        # Never leave a dangling time-in-force if the expiry itself was dropped.
+        tif_prop = self._property_for("time_in_force")
+        expiry_prop = self._property_for("expiry")
+        if tif_prop and expiry_prop and tif_prop in arguments and expiry_prop not in arguments:
+            arguments.pop(tif_prop)
+        return arguments
+
+    def _property_for(self, canonical: str) -> Optional[str]:
+        """Upstream property name that carries ``canonical`` on create_order."""
+        tool = self._tool(TOOL_CREATE_ORDER)
+        if tool is None:
+            return None
+        from mcp_client.schema import map_properties
+        for prop, mapped in map_properties(tool).items():
+            if mapped == canonical:
+                return prop
+        return None
 
     def _cfg_extra_order_fields(self) -> dict[str, Any]:
         return dict(getattr(self._cfg, "extra_order_fields", {}) or {})
@@ -614,7 +668,11 @@ class CTraderGateway:
     async def cancel_order(self, order_id: str) -> Any:
         return await self._call(TOOL_CANCEL_ORDER, {"order_id": order_id})
 
-    async def close_position(self, position_id: str, volume_lots: Optional[float] = None) -> Any:
+    async def close_position(self, position_id: str,
+                             volume_lots: Optional[float] = None) -> Any:
+        """Close a position. ``volume`` is required by the live schema, so the
+        caller must say how much - a partial close needs it and a full close
+        cannot omit it."""
         values: dict[str, Any] = {"position_id": position_id}
         if volume_lots is not None:
             values["volume"] = self.lots_to_wire(volume_lots)

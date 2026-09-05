@@ -132,6 +132,9 @@ v1.0.18), not assumed, and the client is built around them:
 | `get_trendbars` args | The schema advertises "(count) → last N bars", but the server **rejects it** with `fromTimestamp: must not be null` |
 | `get_spot_prices` | Takes `symbolId` as an **array** of integers |
 | Symbol listing | `symbolId`/`symbolName`/`description` only — no `digits` or `lotSize` |
+| `create_order.volume` | Declared **`integer`** — so it is not lots. cTrader carries volume as 1/100 of a unit, so 0.10 BTC is `10` and 0.08 lots of gold is `800` |
+| `create_order` expiry | `expirationTimestamp` is an **integer** (epoch ms), paired with `timeInForce=GOOD_TILL_DATE` |
+| Order/position ids | Integers, not strings |
 
 Two of these shaped the design directly:
 
@@ -140,9 +143,16 @@ Two of these shaped the design directly:
   `PRICE_SCALE` / `MONEY_SCALE` if a server build differs. Getting this wrong is
   not a cosmetic bug — it is a 100,000× position-sizing error.
 * Because a tool's declared schema and its actual validation can disagree,
-  candle fetching walks a ladder of argument combinations
-  (`from`+`to` → `to`+`count` → `count`) and widens the time span when a
-  weekend or market close returns too few bars.
+  candle fetching walks a ladder of argument combinations and keeps the richest
+  result. `count` is always sent alongside `from`/`to` where the schema allows
+  it: without it the server applies its own default of 100 and silently
+  truncates the history, which looks exactly like a closed market.
+* An integer-typed `volume` is decisive evidence that the field is not carrying
+  lots — lot sizes are fractional. Reading it as lots makes `int(round(0.10))`
+  zero and every order is rejected, so the bot infers cTrader centi-units and
+  says so in the log.
+* A value the schema cannot represent is **dropped**, not sent: an ISO timestamp
+  bound into an `integer` field would get the whole order rejected.
 
 ### Resilience
 
@@ -312,7 +322,7 @@ reading before going live:
 ## Testing
 
 ```bash
-pytest            # 49 tests: strategy, risk, transport, instruments, integration
+pytest            # 53 tests: strategy, risk, transport, instruments, integration
 ```
 
 The integration tests run the entire bot — gateway, strategy, guards, sizing,

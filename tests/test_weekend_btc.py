@@ -135,8 +135,10 @@ async def test_saturday_tick_trades_btc_not_gold(monkeypatch):
     assert order["label"] == "SB-BTCUSD-20260905-AFTERNOON"
     assert order["limitPrice"] == pytest.approx(79_532.50, abs=0.5)
     assert order["stopLoss"] == pytest.approx(80_503.00, abs=0.5)
-    # 1% of 10,000 = $100 behind a 970.50 stop at 1 BTC/lot -> 0.10 lots.
-    assert order["volume"] == pytest.approx(0.10, abs=0.005)
+    # 1% of 10,000 = $100 behind a 970.50 stop at 1 BTC/lot -> 0.10 lots,
+    # sent as centi-units: 0.10 lots x 1 BTC x 100 = 10.
+    assert order["volume"] == 10
+    assert isinstance(order["volume"], int)
 
 
 @pytest.mark.asyncio
@@ -165,3 +167,53 @@ async def test_switching_days_switches_instrument_without_reconnecting(monkeypat
     assert [o["symbolId"] for o in connection.orders] == [41, 10026]
     assert bot.gateway.active_name == "BTCUSD"
     assert bot.strategy.profile.name == "BTCUSD"
+
+
+# --- the live create_order schema ----------------------------------------
+
+def test_integer_volume_field_is_sent_as_centi_units():
+    """The live server declares `volume` as an integer, so lots are impossible.
+
+    Sending 0.10 lots into an integer field rounds it to zero and the order is
+    rejected, so an integer volume is read as cTrader centi-units instead.
+    """
+    from mcp_client.ctrader import CTraderGateway
+    from tests.fake_mcp import FakeConnection
+
+    gateway = CTraderGateway(load_config(), FakeConnection())
+    assert gateway.resolve_volume_mode() == "centiunits"
+    gateway.active_name = "BTCUSD"
+    assert gateway.lots_to_wire(0.10) == pytest.approx(10.0)   # 0.10 BTC x 100
+    gateway.active_name = "XAUUSD"
+    assert gateway.lots_to_wire(0.08) == pytest.approx(800.0)  # 8 oz x 100
+
+
+def test_broker_volumes_round_trip_back_to_lots():
+    from mcp_client.ctrader import CTraderGateway
+    from tests.fake_mcp import FakeConnection
+
+    gateway = CTraderGateway(load_config(), FakeConnection())
+    for symbol, lots in (("BTCUSD", 0.10), ("XAUUSD", 0.08)):
+        gateway.active_name = symbol
+        assert gateway._volume_to_lots(gateway.lots_to_wire(lots)) == pytest.approx(lots)
+
+
+def test_a_short_alias_cannot_hijack_an_unrelated_field():
+    """`n` once matched the n in expiratio[n]Timestamp, routing a bar count there."""
+    from mcp_client.schema import ToolSpec, map_properties
+
+    tool = ToolSpec("create_order", "", {"type": "object", "properties": {
+        "expirationTimestamp": {"type": "integer"}, "count": {"type": "integer"}}})
+    mapping = map_properties(tool)
+    assert mapping["expirationTimestamp"] == "expiry"
+    assert mapping["count"] == "count"
+
+
+def test_a_value_the_schema_cannot_represent_is_dropped_not_sent():
+    from mcp_client.schema import Candidates, ToolSpec, bind_arguments
+
+    tool = ToolSpec("t", "", {"type": "object",
+                              "properties": {"expirationTimestamp": {"type": "integer"}}})
+    assert bind_arguments(tool, {"expiry": "2026-09-05T21:01:27Z"}) == {}
+    bound = bind_arguments(tool, {"expiry": Candidates.of(1788634887000, "2026-09-05T21:01:27Z")})
+    assert bound == {"expirationTimestamp": 1788634887000}

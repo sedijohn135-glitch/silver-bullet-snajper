@@ -100,7 +100,10 @@ async def test_live_mode_submits_a_schema_bound_limit_order(monkeypatch):
     assert order["takeProfit"] == pytest.approx(4392.00, abs=0.01)
     assert order["label"] == "SB-XAUUSD-20260904-AFTERNOON"
     # 1% of 10,000 = $100 behind an 11.50 stop on 100oz/lot -> 0.08 lots.
-    assert order["volume"] == pytest.approx(0.08)
+    # The live schema declares volume as an integer, so it goes on the wire as
+    # cTrader centi-units: 0.08 lots x 100 oz x 100 = 800.
+    assert order["volume"] == 800
+    assert isinstance(order["volume"], int)
 
 
 @pytest.mark.asyncio
@@ -119,8 +122,8 @@ async def test_one_trade_per_window_is_enforced_across_ticks(monkeypatch):
 async def test_a_redeployed_bot_sees_its_own_resting_order(monkeypatch):
     """In-memory state is gone, but the broker still holds the labelled order."""
     resting = [{
-        "orderId": "o-1", "symbolId": 41, "symbolName": "XAUUSD", "tradeSide": "SELL",
-        "volume": 0.08, "limitPrice": 441950000, "label": "SB-XAUUSD-20260904-AFTERNOON",
+        "orderId": 5001, "symbolId": 41, "symbolName": "XAUUSD", "tradeSide": "SELL",
+        "volume": 800, "limitPrice": 441950000, "label": "SB-XAUUSD-20260904-AFTERNOON",
         "orderType": "LIMIT",
     }]
     connection = FakeConnection(balance=10_000.0, pending=resting)
@@ -176,8 +179,8 @@ async def test_outside_the_window_nothing_is_analysed(monkeypatch):
 @pytest.mark.asyncio
 async def test_stale_order_from_an_earlier_window_is_cancelled(monkeypatch):
     stale = [{
-        "orderId": "o-old", "symbolId": 41, "symbolName": "XAUUSD", "tradeSide": "SELL",
-        "volume": 0.05, "limitPrice": 442000000, "label": "SB-XAUUSD-20260904-MORNING",
+        "orderId": 4001, "symbolId": 41, "symbolName": "XAUUSD", "tradeSide": "SELL",
+        "volume": 500, "limitPrice": 442000000, "label": "SB-XAUUSD-20260904-MORNING",
         "orderType": "LIMIT",
     }]
     connection = FakeConnection(balance=10_000.0, pending=stale)
@@ -185,4 +188,4 @@ async def test_stale_order_from_an_earlier_window_is_cancelled(monkeypatch):
 
     await bot._tick()
 
-    assert connection.cancelled == ["o-old"]
+    assert connection.cancelled == ["4001"]

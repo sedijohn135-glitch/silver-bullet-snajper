@@ -52,28 +52,40 @@ TOOLS = [
         "properties": {"fromTimestamp": {"type": "string"}, "toTimestamp": {"type": "string"}},
         "required": ["fromTimestamp", "toTimestamp"],
     }),
-    ToolSpec("create_order", "Create a market or limit order", {
+    # Verbatim from the live server's tools/list (ctrader-trading v0.4.0).
+    # `volume` really is an integer: cTrader carries it as 1/100 of a unit.
+    ToolSpec("create_order", "Create an order", {
         "type": "object",
         "properties": {
             "symbolId": {"type": "integer"},
-            "orderType": {"type": "string", "enum": ["MARKET", "LIMIT", "STOP"]},
+            "orderType": {"type": "string",
+                          "enum": ["MARKET", "LIMIT", "STOP", "MARKET_RANGE", "STOP_LIMIT"]},
             "tradeSide": {"type": "string", "enum": ["BUY", "SELL"]},
-            "volume": {"type": "number", "description": "Order volume in lots"},
+            "volume": {"type": "integer"},
             "limitPrice": {"type": "number"},
+            "stopPrice": {"type": "number"},
             "stopLoss": {"type": "number"},
             "takeProfit": {"type": "number"},
-            "label": {"type": "string"},
+            "relativeStopLoss": {"type": "integer"},
+            "relativeTakeProfit": {"type": "integer"},
             "comment": {"type": "string"},
+            "label": {"type": "string"},
+            "timeInForce": {"type": "string",
+                            "enum": ["GOOD_TILL_CANCEL", "GOOD_TILL_DATE", "IMMEDIATE_OR_CANCEL"]},
+            "baseSlippagePrice": {"type": "number"},
+            "slippageInPoints": {"type": "integer"},
+            "expirationTimestamp": {"type": "integer"},
         },
         "required": ["symbolId", "orderType", "tradeSide", "volume"],
     }),
     ToolSpec("cancel_order", "Cancel a pending order", {
         "type": "object",
-        "properties": {"orderId": {"type": "string"}}, "required": ["orderId"],
+        "properties": {"orderId": {"type": "integer"}}, "required": ["orderId"],
     }),
     ToolSpec("close_position", "Close an open position", {
         "type": "object",
-        "properties": {"positionId": {"type": "string"}}, "required": ["positionId"],
+        "properties": {"positionId": {"type": "integer"}, "volume": {"type": "integer"}},
+        "required": ["positionId", "volume"],
     }),
 ]
 
@@ -185,7 +197,7 @@ class FakeConnection:
         return {"orderId": f"ord-{len(self.orders)}", "status": "ACCEPTED"}
 
     def _cancel_order(self, args: dict) -> dict:
-        self.cancelled.append(args.get("orderId", ""))
+        self.cancelled.append(str(args.get("orderId", "")))
         return {"status": "CANCELLED"}
 
     def _close_position(self, args: dict) -> dict:

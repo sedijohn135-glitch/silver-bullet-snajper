@@ -191,7 +191,14 @@ class SilverBulletBot:
         self.state.last_rejections = list(result.rejections)
 
         if not result.found:
-            log.info("[%s] No setup: %s", label, "; ".join(result.rejections) or "no candidates")
+            # The loop polls every few seconds; only speak when the picture
+            # actually changes, otherwise a quiet window buries the log.
+            summary = " | ".join(result.rejections) or "no candidates"
+            if self._logged_block.get(f"{label}:analysis") != summary:
+                self._logged_block[f"{label}:analysis"] = summary
+                log.info("[%s] No setup: %s", label, summary)
+            else:
+                log.debug("[%s] No setup (unchanged)", label)
             return
 
         setup = result.setup

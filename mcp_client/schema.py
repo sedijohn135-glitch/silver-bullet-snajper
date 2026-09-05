@@ -113,7 +113,7 @@ CANONICAL_ALIASES: dict[str, tuple[str, ...]] = {
     "stop_price": ("stopprice", "stoporderprice", "triggerprice"),
     "period": ("period", "timeframe", "periodtype", "interval", "resolution",
                "granularity", "bartype"),
-    "count": ("count", "limit", "bars", "barcount", "maxbars", "numberofbars", "n"),
+    "count": ("count", "limit", "bars", "barcount", "maxbars", "numberofbars", "maxrows"),
     "from_ts": ("fromtimestamp", "from", "starttime", "start", "fromtime",
                 "fromdate", "since", "begintime"),
     "to_ts": ("totimestamp", "to", "endtime", "end", "totime", "todate", "until"),
@@ -137,6 +137,9 @@ _FALLBACK_ORDER: tuple[str, ...] = (
     "count", "position_id", "order_id", "deal_id", "volume", "label", "comment",
     "client_order_id", "expiry", "time_in_force",
 )
+
+#: Aliases shorter than this are exact-match only (see :func:`map_properties`).
+MIN_SUBSTRING_ALIAS = 4
 
 _NORM_ALIASES: dict[str, tuple[str, ...]] = {
     canonical: tuple(normalize(a) for a in aliases)
@@ -176,6 +179,12 @@ def map_properties(tool: ToolSpec) -> dict[str, str]:
 
     # Pass 2 - substring fallback for names we have not seen before
     # (e.g. "stopLossInPoints"), most-specific canonical first.
+    #
+    # Only aliases of at least MIN_SUBSTRING_ALIAS characters take part. Short
+    # ones are far too greedy as substrings: "n" (an alias for `count`) matches
+    # the n in "expiratio[n]Timestamp", which silently routed a bar count into
+    # an order's expiry field. Short aliases still work in pass 1, where the
+    # match has to be exact.
     for prop in tool.properties:
         if prop in mapping:
             continue
@@ -183,7 +192,8 @@ def map_properties(tool: ToolSpec) -> dict[str, str]:
         for canonical in _FALLBACK_ORDER:
             if canonical in taken:
                 continue
-            if any(alias and alias in norm for alias in _NORM_ALIASES[canonical]):
+            if any(len(alias) >= MIN_SUBSTRING_ALIAS and alias in norm
+                   for alias in _NORM_ALIASES[canonical]):
                 mapping[prop] = canonical
                 taken.add(canonical)
                 break
@@ -225,8 +235,19 @@ def _enum_values(prop_schema: Mapping[str, Any]) -> list[Any]:
     return []
 
 
+#: Returned when no declared type can represent a value. Distinct from None,
+#: which is a legitimate "field not supplied".
+UNCOERCIBLE = object()
+
+
 def _coerce(value: Any, types: Sequence[str]) -> Any:
-    """Coerce ``value`` to the first declared JSON type that accepts it."""
+    """Coerce ``value`` to the first declared JSON type that accepts it.
+
+    Returns :data:`UNCOERCIBLE` when none of them can. Sending a value the
+    schema cannot represent - an ISO timestamp into an ``integer`` field, say -
+    gets the whole order rejected, so the caller tries the next candidate (or
+    drops an optional field) instead.
+    """
     if not types:
         return value
     for declared in types:
@@ -249,7 +270,7 @@ def _coerce(value: Any, types: Sequence[str]) -> Any:
                 return value
         except (TypeError, ValueError):
             continue
-    return value
+    return UNCOERCIBLE
 
 
 def _match_enum(value: Any, enum: Sequence[Any]) -> Optional[Any]:
@@ -285,8 +306,16 @@ def bind_value(prop_schema: Mapping[str, Any], value: Any) -> Optional[Any]:
         if is_array:
             raw_items = list(candidate) if isinstance(candidate, (list, tuple, set)) else [candidate]
             item_types = _declared_types(item_schema) if item_schema else []
-            return [_coerce(item, item_types) if item_types else item for item in raw_items]
-        return _coerce(candidate, types)
+            coerced_items = [
+                _coerce(item, item_types) if item_types else item for item in raw_items
+            ]
+            if any(item is UNCOERCIBLE for item in coerced_items):
+                continue
+            return coerced_items
+        coerced = _coerce(candidate, types)
+        if coerced is UNCOERCIBLE:
+            continue        # this representation does not fit; try the next one
+        return coerced
     return None
 
 
@@ -354,6 +383,11 @@ def bind_arguments(
     if unknown:
         log.debug("Tool %s has no property for canonicals %s (dropped)", tool.name, unknown)
     return result.arguments
+
+
+def declared_types(prop_schema: Mapping[str, Any]) -> list[str]:
+    """Public accessor for a property's declared JSON types."""
+    return _declared_types(prop_schema)
 
 
 def wants_units(prop_name: str, prop_schema: Mapping[str, Any]) -> Optional[bool]:
