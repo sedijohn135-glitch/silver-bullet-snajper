@@ -414,6 +414,22 @@ class SilverBulletBot:
             f"  <code>{esc(p.describe())}</code>" for p in (cfg.profiles or {}).values()
         )
 
+        # The banner must name the sizing mode actually in force. Printing the
+        # risk percentage unconditionally was misleading: under fixed sizing that
+        # percentage is not used at all.
+        if cfg.fixed_lot_size > 0:
+            total = round(cfg.fixed_lot_size * cfg.entry_layers, 8)
+            sizing_line = (f"FIXED {cfg.fixed_lot_size} x {cfg.entry_layers} "
+                           f"= {total} lots/setup")
+            if cfg.max_risk_pct > 0:
+                sizing_line += f", capped at {cfg.max_risk_pct:.0f}%"
+            else:
+                sizing_line += ", <b>no risk cap</b>"
+        else:
+            sizing_line = f"auto {cfg.risk_per_trade_pct:.2f}%/trade"
+            if cfg.entry_layers > 1:
+                sizing_line += f" over {cfg.entry_layers} layers"
+
         tools = self.connection.catalog.names
         await self._notifier.send(
             f"{icon} <b>ICT Silver Bullet bot online</b>\n"
@@ -421,7 +437,8 @@ class SilverBulletBot:
             f"{specs}\n"
             f"<b>Account</b> {esc(self._token.describe())}\n"
             f"<b>Mode</b> {mode_line}\n"
-            f"<b>Risk</b> {cfg.risk_per_trade_pct:.2f}%/trade, "
+            f"<b>Sizing</b> {sizing_line}\n"
+            f"<b>Risk</b> "
             + (f"{cfg.daily_max_drawdown_pct:.2f}% daily stop"
                if cfg.daily_max_drawdown_pct > 0 else "<b>daily stop OFF</b>")
             + f", min {cfg.min_rr:.1f}R\n"
