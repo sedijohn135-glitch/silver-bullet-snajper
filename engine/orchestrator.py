@@ -438,6 +438,15 @@ class SilverBulletBot:
         return {
             "healthy": self.connection.state in (ConnectionState.READY, ConnectionState.CONNECTING),
             "mode": self._cfg.trading_mode,
+            "sizing": (
+                {"mode": "fixed", "lots_per_layer": self._cfg.fixed_lot_size,
+                 "layers": self._cfg.entry_layers,
+                 "max_risk_pct": self._cfg.max_risk_pct}
+                if self._cfg.fixed_lot_size > 0 else
+                {"mode": "risk_pct", "risk_per_trade_pct": self._cfg.risk_per_trade_pct,
+                 "layers": self._cfg.entry_layers}
+            ),
+            "daily_max_drawdown_pct": self._cfg.daily_max_drawdown_pct or "disabled",
             "environment": self._token.environment or "unknown",
             "symbol": self.gateway.active_name,
             "weekday_symbol": self._cfg.symbol,

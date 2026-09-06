@@ -50,6 +50,26 @@ def announce_instruments(cfg: Config) -> None:
     log.info("Trading calendar: %s Mon-Fri, %s", cfg.symbol, weekend)
     for profile in (cfg.profiles or {}).values():
         log.info("  profile | %s", profile.describe())
+    # Position sizing is the setting operators change most often, and until now
+    # nothing in the boot output confirmed which mode was actually in force -
+    # so a mistyped variable looked exactly like a working one.
+    if cfg.fixed_lot_size > 0:
+        total = cfg.fixed_lot_size * cfg.entry_layers
+        log.info("Sizing: FIXED %s lots x %d layer(s) = %s lots per setup. "
+                 "RISK_PER_TRADE_PCT (%.2f%%) is NOT used in this mode.",
+                 cfg.fixed_lot_size, cfg.entry_layers, round(total, 8),
+                 cfg.risk_per_trade_pct)
+        if cfg.max_risk_pct > 0:
+            log.info("Sizing: refused if that risks more than %.2f%% of balance "
+                     "(MAX_RISK_PCT).", cfg.max_risk_pct)
+        else:
+            log.warning("Sizing: MAX_RISK_PCT=0 - no ceiling on what a fixed-size "
+                        "trade may risk.")
+    else:
+        log.info("Sizing: automatic, %.2f%% of balance risked per setup, "
+                 "split across %d layer(s).",
+                 cfg.risk_per_trade_pct, cfg.entry_layers)
+
     if cfg.daily_max_drawdown_pct <= 0:
         log.warning("DAILY DRAWDOWN HALT IS DISABLED (DAILY_MAX_DRAWDOWN_PCT=0). "
                     "Nothing stops the bot after a run of losing trades.")
