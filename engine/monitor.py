@@ -52,12 +52,30 @@ class TradeMonitor:
         self._tracked: dict[str, Position] = {}
         #: position id -> polls spent waiting for its closing deal to appear.
         self._awaiting_deals: dict[str, int] = {}
+        #: False until the first poll has seen what was already open.
+        self._synced = False
 
     async def poll(self, day_start: datetime) -> MonitorReport:
         """Refresh account state and emit notifications for any transitions."""
         positions = await self._gateway.get_positions()
         pending = await self._gateway.get_pending_orders()
         deals = await self._gateway.get_deals(day_start)
+
+        if not self._synced:
+            # First poll of this process. Railway containers are ephemeral, so
+            # the local state file is gone after every redeploy and everything
+            # already open would look newly filled. Adopt what exists silently -
+            # a position that was open before this process started is not a fill
+            # this process just saw.
+            self._synced = True
+            adopted = {p.position_id for p in positions if p.position_id}
+            if adopted - self._state.known_position_ids:
+                log.info("Adopting %d position(s) already open at start-up: %s",
+                         len(adopted), sorted(adopted))
+            self._state.known_position_ids |= adopted
+            self._state.known_order_ids |= {o.order_id for o in pending if o.order_id}
+            self._tracked = {p.position_id: p for p in positions}
+            return MonitorReport(positions, pending, deals, [], [])
 
         filled = self._detect_fills(positions)
         closed = await self._detect_closures(positions, deals)

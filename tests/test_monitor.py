@@ -51,6 +51,7 @@ async def test_a_fill_is_reported_even_when_the_broker_drops_our_label():
     """Brokers do not reliably echo an order's label onto the position."""
     connection = FakeConnection()
     monitor, _ = await build(connection)
+    await monitor.poll(DAY)          # first poll syncs whatever already existed
 
     connection.positions = [position_record(669454576, label="")]   # no label
     report = await monitor.poll(DAY)
@@ -64,6 +65,7 @@ async def test_a_closure_with_no_deal_yet_is_deferred_not_reported_as_zero():
     connection = FakeConnection()
     monitor, _ = await build(connection)
 
+    await monitor.poll(DAY)                     # sync poll
     connection.positions = [position_record(669454576)]
     await monitor.poll(DAY)                     # position is now tracked
 
@@ -85,6 +87,7 @@ async def test_a_closure_whose_deal_never_arrives_is_reported_as_unknown():
     connection = FakeConnection()
     monitor, _ = await build(connection)
 
+    await monitor.poll(DAY)                     # sync poll
     connection.positions = [position_record(669454576)]
     await monitor.poll(DAY)
     connection.positions = []
@@ -102,6 +105,7 @@ async def test_a_closure_is_only_reported_once():
     connection = FakeConnection()
     monitor, _ = await build(connection)
 
+    await monitor.poll(DAY)                     # sync poll
     connection.positions = [position_record(669454576)]
     await monitor.poll(DAY)
     connection.positions = []
@@ -136,6 +140,7 @@ def test_position_prices_are_not_unscaled_twice():
 async def test_a_position_read_back_keeps_its_real_prices():
     connection = FakeConnection()
     monitor, _ = await build(connection)
+    await monitor.poll(DAY)                     # sync poll
     connection.positions = [{
         "positionId": 1, "symbolId": 10026, "symbolName": "BTCUSD",
         # BTCUSD is 1 BTC per lot, so 0.05 lots is 5 centi-units - not the 500
@@ -151,3 +156,24 @@ async def test_a_position_read_back_keeps_its_real_prices():
     assert position.stop_loss == pytest.approx(79_922.89)
     assert position.take_profit == pytest.approx(79_637.53)
     assert position.volume == pytest.approx(0.05)      # 500 centi-units
+
+
+@pytest.mark.asyncio
+async def test_positions_open_before_boot_are_adopted_without_a_fill_alert():
+    """Railway wipes the state file on every redeploy.
+
+    Without this, each redeploy re-announced every open position as a fresh
+    fill - which is exactly the alert that must stay trustworthy.
+    """
+    connection = FakeConnection()
+    monitor, state = await build(connection)
+    connection.positions = [position_record(669496943, label="SB-BTCUSD-MORNING")]
+
+    first = await monitor.poll(DAY)
+    assert first.filled == [], "an already-open position is not a new fill"
+    assert "669496943" in state.known_position_ids
+
+    # A genuinely new one, after the sync, still gets announced.
+    connection.positions.append(position_record(669499999))
+    second = await monitor.poll(DAY)
+    assert [p.position_id for p in second.filled] == ["669499999"]
