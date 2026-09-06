@@ -147,7 +147,7 @@ class OrderExecutor:
 
         if len(requests) > 1:
             rungs = "\n".join(
-                f"   L{i}: {r.volume_lots} @ {r.price:.2f}"
+                f"   L{i}: {round(r.volume_lots, 8):g} @ {r.price:.2f}"
                 for i, r in enumerate(requests, start=1)
             )
             entry_block = (f"<b>Entry ladder</b> {len(requests)} x {sizing.lots_per_layer} "
@@ -158,7 +158,7 @@ class OrderExecutor:
         await self._notifier.send(
             f"{header}\n"
             f"{arrow} <b>{esc(setup.direction.value)} LIMIT "
-            f"{esc(self._gateway.active_name)}</b> {sizing.lots} lots total\n"
+            f"{esc(self._gateway.active_name)}</b> {round(sizing.lots, 8):g} lots total\n"
             f"{entry_block}"
             f"<b>SL</b> {setup.stop_loss:.2f}  ({setup.stop_distance / point:.0f}pt)\n"
             f"<b>TP</b> {setup.take_profit:.2f}  ({setup.risk_reward:.2f}R)\n"

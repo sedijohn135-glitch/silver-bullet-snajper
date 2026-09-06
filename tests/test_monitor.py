@@ -111,3 +111,43 @@ async def test_a_closure_is_only_reported_once():
     second = await monitor.poll(DAY)
     assert len(first.closed) == 1 and first.closed[0].pnl == pytest.approx(12.50)
     assert second.closed == []
+
+
+# --- price conventions differ per payload --------------------------------
+
+def test_position_prices_are_not_unscaled_twice():
+    """get_positions returns real prices; get_spot_prices returns them x1e5.
+
+    Dividing a position's 79851.50 entry a second time gave 0.80 - and so did
+    its stop and its target, three different levels collapsing onto one number.
+    """
+    from utils.prices import Scale, normalize_price
+
+    scale = Scale(100_000.0, "detected")
+    for real in (79_851.50, 79_922.89, 79_637.53, 4_431.23):
+        assert normalize_price(real, scale, 1_000, 1_000_000) == pytest.approx(real)
+    # A genuinely scaled value still gets unscaled.
+    assert normalize_price(7_985_150_000, scale, 1_000, 1_000_000) == pytest.approx(79_851.50)
+    assert normalize_price(None, scale, 1_000, 1_000_000) is None
+    assert normalize_price(0.0, scale, 1_000, 1_000_000) == 0.0
+
+
+@pytest.mark.asyncio
+async def test_a_position_read_back_keeps_its_real_prices():
+    connection = FakeConnection()
+    monitor, _ = await build(connection)
+    connection.positions = [{
+        "positionId": 1, "symbolId": 10026, "symbolName": "BTCUSD",
+        # BTCUSD is 1 BTC per lot, so 0.05 lots is 5 centi-units - not the 500
+        # a 100oz gold lot would give.
+        "tradeSide": "SELL", "volume": 5,
+        # Real prices, exactly as the live server sends them for positions.
+        "entryPrice": 79851.50, "stopLoss": 79922.89, "takeProfit": 79637.53,
+        "label": "SB-BTCUSD-20260906-MORNING",
+    }]
+    report = await monitor.poll(DAY)
+    position = report.positions[0]
+    assert position.entry_price == pytest.approx(79_851.50)
+    assert position.stop_loss == pytest.approx(79_922.89)
+    assert position.take_profit == pytest.approx(79_637.53)
+    assert position.volume == pytest.approx(0.05)      # 500 centi-units

@@ -31,7 +31,9 @@ from models import (
 )
 from symbols import SymbolProfile, profile_for
 from utils.logging import get_logger
-from utils.prices import Scale, resolve_money_scale, resolve_price_scale
+from utils.prices import (
+    Scale, normalize_price, resolve_money_scale, resolve_price_scale,
+)
 from utils.timeframes import get_timeframe
 
 log = get_logger("ctrader")
@@ -428,10 +430,10 @@ class CTraderGateway:
                     symbol_name=str(pick(record, "symbolName", "symbol", default="")),
                     side=normalize_side(pick(record, "tradeSide", "side", "direction")),
                     volume=self._volume_to_lots(as_float(pick(record, "volume", "lots", "quantity"), 0.0) or 0.0),
-                    entry_price=self.price_scale.apply(
+                    entry_price=self._account_price(
                         as_float(pick(record, "entryPrice", "openPrice", "price"), None)),
-                    stop_loss=self.price_scale.apply(as_float(pick(record, "stopLoss", "sl"), None)),
-                    take_profit=self.price_scale.apply(as_float(pick(record, "takeProfit", "tp"), None)),
+                    stop_loss=self._account_price(as_float(pick(record, "stopLoss", "sl"), None)),
+                    take_profit=self._account_price(as_float(pick(record, "takeProfit", "tp"), None)),
                     label=str(pick(record, "label", "comment", default="")),
                     open_time=parse_timestamp(pick(record, "openTimestamp", "openTime", "timestamp")),
                     profit=self.money_scale.apply(
@@ -452,11 +454,11 @@ class CTraderGateway:
                     symbol_name=str(pick(record, "symbolName", "symbol", default="")),
                     side=normalize_side(pick(record, "tradeSide", "side", "direction")),
                     volume=self._volume_to_lots(as_float(pick(record, "volume", "lots", "quantity"), 0.0) or 0.0),
-                    price=self.price_scale.apply(
+                    price=self._account_price(
                         as_float(pick(record, "limitPrice", "price", "stopPrice"), None)),
                     order_type=str(pick(record, "orderType", "type", default="")),
-                    stop_loss=self.price_scale.apply(as_float(pick(record, "stopLoss", "sl"), None)),
-                    take_profit=self.price_scale.apply(as_float(pick(record, "takeProfit", "tp"), None)),
+                    stop_loss=self._account_price(as_float(pick(record, "stopLoss", "sl"), None)),
+                    take_profit=self._account_price(as_float(pick(record, "takeProfit", "tp"), None)),
                     label=str(pick(record, "label", "comment", default="")),
                     created_time=parse_timestamp(pick(record, "timestamp", "createdTime", "openTime")),
                     raw=record if isinstance(record, dict) else {},
@@ -490,7 +492,7 @@ class CTraderGateway:
                     symbol_id=as_int(pick(record, "symbolId"), None),
                     position_id=str(pick(record, "positionId", default="")) or None,
                     volume=self._volume_to_lots(as_float(pick(record, "volume", "quantity"), 0.0) or 0.0),
-                    price=self.price_scale.apply(as_float(pick(record, "executionPrice", "price"), None)),
+                    price=self._account_price(as_float(pick(record, "executionPrice", "price"), None)),
                     profit=profit,
                     commission=self.money_scale.apply(commission) or 0.0,
                     swap=self.money_scale.apply(swap) or 0.0,
@@ -596,6 +598,12 @@ class CTraderGateway:
             "relative" in normalize(prop) and core in normalize(prop)
             for prop in tool.properties
         )
+
+    def _account_price(self, raw: Optional[float]) -> Optional[float]:
+        """A price read back from a position, order or deal."""
+        profile = self.profile
+        return normalize_price(raw, self.price_scale,
+                               profile.sane_price_min, profile.sane_price_max)
 
     def _price_field_mode(self, canonical: str) -> str:
         """Does the SL/TP field want an absolute price, pips, or points?
