@@ -174,7 +174,7 @@ class Config:
 
     # --- risk -------------------------------------------------------------
     risk_per_trade_pct: float = 1.0
-    daily_max_drawdown_pct: float = 3.0
+    daily_max_drawdown_pct: float = 3.0    # 0 disables the daily halt entirely
     min_rr: float = 2.0
     max_spread_points: float = 35.0
     sl_buffer_points: float = 20.0
@@ -262,7 +262,7 @@ def load_config() -> Config:
         sane_price_min=env_float("SANE_PRICE_MIN", 100.0, minimum=0.0),
         sane_price_max=env_float("SANE_PRICE_MAX", 100_000.0, minimum=1.0),
         risk_per_trade_pct=env_float("RISK_PER_TRADE_PCT", 1.0, minimum=0.01, maximum=10.0),
-        daily_max_drawdown_pct=env_float("DAILY_MAX_DRAWDOWN_PCT", 3.0, minimum=0.1, maximum=100.0),
+        daily_max_drawdown_pct=env_float("DAILY_MAX_DRAWDOWN_PCT", 3.0, minimum=0.0, maximum=100.0),
         min_rr=env_float("MIN_RR", 2.0, minimum=0.1),
         max_spread_points=env_float("MAX_SPREAD_POINTS", 35.0, minimum=0.0),
         sl_buffer_points=env_float("SL_BUFFER_POINTS", 20.0, minimum=0.0),

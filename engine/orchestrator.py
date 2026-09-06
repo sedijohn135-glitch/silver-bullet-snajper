@@ -422,7 +422,9 @@ class SilverBulletBot:
             f"<b>Account</b> {esc(self._token.describe())}\n"
             f"<b>Mode</b> {mode_line}\n"
             f"<b>Risk</b> {cfg.risk_per_trade_pct:.2f}%/trade, "
-            f"{cfg.daily_max_drawdown_pct:.2f}% daily stop, min {cfg.min_rr:.1f}R\n"
+            + (f"{cfg.daily_max_drawdown_pct:.2f}% daily stop"
+               if cfg.daily_max_drawdown_pct > 0 else "<b>daily stop OFF</b>")
+            + f", min {cfg.min_rr:.1f}R\n"
             f"<b>Windows</b> 09:00-10:00, 16:00-17:00, 20:00-21:00 Europe/Tirane\n"
             f"<b>MCP</b> {len(tools)} tools, session "
             f"<code>{esc(self.connection.stats.session_id or 'n/a')}</code>",

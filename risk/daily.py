@@ -60,7 +60,11 @@ def compute_daily_pnl(
 
     change = realized + unrealized
     loss_pct = max(0.0, -change / day_start_balance * 100.0)
-    halted = loss_pct >= max_drawdown_pct
+
+    # A limit of 0 means "no daily halt". It has to be checked explicitly:
+    # `loss_pct >= 0` is true for every possible day, so a naive comparison
+    # would turn the switch that disables the guard into one that halts always.
+    halted = max_drawdown_pct > 0 and loss_pct >= max_drawdown_pct
     reason = ""
     if halted:
         reason = (

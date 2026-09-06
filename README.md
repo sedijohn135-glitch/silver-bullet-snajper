@@ -276,7 +276,7 @@ records *why* the first was rejected, so a quiet window still explains itself:
 |---|---|
 | **Position sizing** | Exactly `RISK_PER_TRADE_PCT` (1.0%) of the **live** balance, divided by the actual structural stop distance. `get_balance` is called before every sizing calculation — a cached balance never sizes a position. Lots round **down** onto the volume step; rounding up would breach the limit on every trade. |
 | **Below the minimum lot** | The trade is **refused**, not rounded up. If 1% risk implies 0.004 lots, taking the 0.01 minimum would risk 2.5×the limit. |
-| **Daily drawdown** | Trading halts for the rest of the day at `DAILY_MAX_DRAWDOWN_PCT` (3.0%). Realised P&L is recomputed from the broker's own `get_deals` on every pass, never tallied in memory — a redeploy must not let the bot forget it is already down. Floating P&L on open positions is included by default. |
+| **Daily drawdown** | Trading halts for the rest of the day at `DAILY_MAX_DRAWDOWN_PCT` (3.0%; `0` disables the halt, which is then stated at start-up and in the Telegram banner so it is never silently off). It counts **every** deal on the account since local midnight, including trades placed by hand. Realised P&L is recomputed from the broker's own `get_deals` on every pass, never tallied in memory — a redeploy must not let the bot forget it is already down. Floating P&L on open positions is included by default. |
 | **One trade per window** | Enforced by writing a window label (`SB-BTCUSD-20260905-AFTERNOON`) onto every order and reading it back off `get_positions`/`get_pending_orders`. In-memory state resets on redeploy; the broker's order book does not. |
 | **Notional ceiling** | A position whose value exceeds `MAX_NOTIONAL_LEVERAGE` × balance is refused. This is a backstop against a *price-scale* failure: if auto-detection ever picked the wrong divisor, entry price arrives as 8,006,716,000 instead of 80,067 and every other number still looks reasonable. |
 | **Spread guard** | Entry is blocked above the active profile's `max_spread_points` (35 for gold, 700 for BTC), checked from `get_spot_prices` — and re-checked immediately before submission, because a minute can pass between analysis and execution. |
@@ -358,7 +358,7 @@ reading before going live:
 ## Testing
 
 ```bash
-pytest            # 69 tests: strategy, risk, transport, instruments, integration
+pytest            # 70 tests: strategy, risk, transport, instruments, integration
 ```
 
 The integration tests run the entire bot — gateway, strategy, guards, sizing,

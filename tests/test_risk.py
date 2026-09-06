@@ -188,3 +188,16 @@ def test_layer_count_is_reduced_rather_than_refusing_the_setup():
     assert result.layers < 10
     assert result.lots_per_layer >= 0.01
     assert "reduced from 10" in result.reason
+
+
+def test_a_zero_daily_limit_disables_the_halt_rather_than_halting_always():
+    """`loss_pct >= 0` is true every day, so 0 must be checked explicitly."""
+    deals = [Deal("1", 41, "p1", 1.0, 4400.0, -305.0,
+                  executed_at=DAY_START + timedelta(hours=9))]
+    args = dict(balance=9_695.0, deals=deals, positions=[], day_start=DAY_START)
+
+    assert compute_daily_pnl(max_drawdown_pct=3.0, **args).halted is True
+    disabled = compute_daily_pnl(max_drawdown_pct=0.0, **args)
+    assert disabled.halted is False
+    assert disabled.loss_pct > 3.0        # the number is still reported
+    assert check_daily_drawdown(disabled).allowed is True

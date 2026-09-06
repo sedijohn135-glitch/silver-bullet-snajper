@@ -50,6 +50,12 @@ def announce_instruments(cfg: Config) -> None:
     log.info("Trading calendar: %s Mon-Fri, %s", cfg.symbol, weekend)
     for profile in (cfg.profiles or {}).values():
         log.info("  profile | %s", profile.describe())
+    if cfg.daily_max_drawdown_pct <= 0:
+        log.warning("DAILY DRAWDOWN HALT IS DISABLED (DAILY_MAX_DRAWDOWN_PCT=0). "
+                    "Nothing stops the bot after a run of losing trades.")
+    else:
+        log.info("Daily drawdown halt at %.2f%% of the day's opening balance.",
+                 cfg.daily_max_drawdown_pct)
 
 
 def announce_environment(cfg: Config, token: TokenInfo) -> None:
